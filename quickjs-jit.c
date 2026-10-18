@@ -1479,6 +1479,79 @@ static JSValue *jit_get_var(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
     return sp;
 }
 
+/* put_var: a global variable's assignment (JS_SetGlobalVar(), flag 0) */
+static JSValue *jit_put_var(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
+                            JitIC *ic)
+{
+    JSContext *ctx = f->ctx;
+    JSAtom atom = get_u32(op_pc + 1);
+    JSObject *gvo = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    JSObject *go = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int ret;
+
+    /* a lexical global, initialized and writable */
+    pr = ic_slot(gvo, ic->idx, atom, JS_PROP_WRITABLE, JS_PROP_WRITABLE);
+    if (pr && !JS_IsUninitialized(pr->u.value)) {
+        set_value(ctx, &pr->u.value, sp[-1]);
+        return sp - 1;
+    }
+    /* a writable data property of the global object, none of that name
+       in gvo */
+    if (gvo->shape == ic->rshape && (uint32_t)gvo->shape->prop_count == ic->rhash) {
+        pr = ic_slot(go, ic->hidx, atom,
+                     JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH,
+                     JS_PROP_WRITABLE);
+        if (pr) {
+            set_value(ctx, &pr->u.value, sp[-1]);
+            return sp - 1;
+        }
+    }
+    prs = find_own_property(&pr, gvo, atom);
+    if (prs) {
+        ic->idx = prs - get_shape_prop(gvo->shape);
+    } else {
+        prs = find_own_property(&pr, go, atom);
+        if (prs && (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                  JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
+            ic->rshape = gvo->shape;
+            ic->rhash = gvo->shape->prop_count;
+            ic->hidx = prs - get_shape_prop(go->shape);
+        }
+    }
+    f->sf->cur_pc = (uint8_t *)op_pc + 5;
+    ret = JS_SetGlobalVar(ctx, atom, sp[-1], 0);
+    sp--;
+    if (unlikely(ret < 0)) {
+        f->sp = sp;
+        f->pc = op_pc + 5;
+        return NULL;
+    }
+    return sp;
+}
+
+/* call_constructor */
+static JSValue *jit_call_ctor(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
+{
+    JSContext *ctx = f->ctx;
+    int argc = get_u16(op_pc + 1), i;
+    JSValue *argv = sp - argc, ret;
+
+    f->sf->cur_pc = (uint8_t *)op_pc + 3;
+    ret = JS_CallConstructorInternal(ctx, argv[-2], argv[-1], argc, vc(argv), 0);
+    if (unlikely(JS_IsException(ret))) {
+        f->sp = sp;
+        f->pc = op_pc + 3;
+        return NULL;
+    }
+    for (i = -2; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    sp -= argc + 2;
+    *sp++ = ret;
+    return sp;
+}
+
 /* ---------------------------------------------------------------------
  * The compiler
  * --------------------------------------------------------------------- */
@@ -2279,6 +2352,12 @@ static int jc_body(JitC *c)
         case OP_get_var: case OP_get_var_undef:
             jc_op_ic(c, pc, (void *)jit_get_var);
             break;
+        case OP_put_var:
+            jc_op_ic(c, pc, (void *)jit_put_var);
+            break;
+        case OP_call_constructor:
+            jc_op_fn(c, pc, (void *)jit_call_ctor);
+            break;
         case OP_push_this:
             /* (only at a function's start: the frame's this) */
             t_ldrd(&c->cb, 0, 1, R_F, offsetof(JSJitFrame, this_obj), 0);
@@ -2381,6 +2460,7 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
             switch (b->byte_code_buf[pc]) {
             case OP_get_field: case OP_get_field2: case OP_get_length:
             case OP_put_field: case OP_get_var: case OP_get_var_undef:
+            case OP_put_var:
                 n_ic++;
             }
         }
