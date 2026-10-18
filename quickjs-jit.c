@@ -2089,6 +2089,104 @@ static int jc_body(JitC *c)
             }
             break;
 
+        /* checked locals (let, const: not before their declaration) */
+        case OP_get_loc_check:
+            {
+                uint32_t n;
+                jc_ldrd(c, 0, 1, R_VAR, get_u16(a) * 8);
+                t_cmpi_enc(&c->cb, 1, JS_TAG_UNINITIALIZED);
+                jc_cold(c, CC_EQ, STUB_OP, pc);
+                n = c->nstub - 1;
+                jc_dup01(c);
+                jc_push01(c);
+                c->stub[n].back = c->cb.len;
+            }
+            break;
+        case OP_get_var_ref_check:
+            {
+                uint32_t n;
+                jc_vref(c, get_u16(a));
+                t_ldrd(&c->cb, 0, 1, R_LR, 0, 0);
+                t_cmpi_enc(&c->cb, 1, JS_TAG_UNINITIALIZED);
+                jc_cold(c, CC_EQ, STUB_OP, pc);
+                n = c->nstub - 1;
+                jc_dup01(c);
+                jc_push01(c);
+                c->stub[n].back = c->cb.len;
+            }
+            break;
+
+        /* array elements: a fast array's, by an int index in range */
+        case OP_get_array_el:
+        case OP_get_array_el2:
+            {
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);           /* the array */
+                t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);            /* the index */
+                t_cmni_enc(&c->cb, 1, t_modimm(1));
+                jc_fix(c, n, 1, CC_NE);
+                t_cmpi_enc(&c->cb, 3, 0);
+                jc_fix(c, n, 1, CC_NE);
+                t_ldst(&c->cb, LS_LDRH, R_IP, 0, offsetof(JSObject, class_id));
+                t_cmpi_enc(&c->cb, R_IP, JS_CLASS_ARRAY);
+                jc_fix(c, n, 1, CC_NE);
+                t_ldst(&c->cb, LS_LDR, R_IP, 0, offsetof(JSObject, u.array.count));
+                t_cmp(&c->cb, 2, R_IP);
+                jc_fix(c, n, 1, CC_HS);
+                if (op == OP_get_array_el) {
+                    /* the array's reference goes: not its last one */
+                    t_ldst(&c->cb, LS_LDR, R_LR, 0, JIT_RC_OFF);
+                    t_cmpi_enc(&c->cb, R_LR, 1);
+                    jc_fix(c, n, 1, CC_LE);
+                    t_dp_imm(&c->cb, DP_SUB, 0, R_LR, R_LR, t_modimm(1));
+                    t_ldst(&c->cb, LS_STR, R_LR, 0, JIT_RC_OFF);
+                }
+                t_ldst(&c->cb, LS_LDR, R_IP, 0, offsetof(JSObject, u.array.u.values));
+                t_dp_reg(&c->cb, DP_ADD, 0, R_IP, R_IP, 2, SH_LSL, 3);
+                t_ldrd(&c->cb, 0, 1, R_IP, 0, 0);
+                jc_dup01(c);
+                if (op == OP_get_array_el) {
+                    t_strd(&c->cb, 0, 1, R_SPV, -16, 0);
+                    t_addi(&c->cb, R_SPV, R_SPV, -8);
+                } else {
+                    t_strd(&c->cb, 0, 1, R_SPV, -8, 0);
+                }
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+        case OP_put_array_el:
+            {
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldrd(&c->cb, 0, 1, R_SPV, -24, 0);           /* the array */
+                t_ldrd(&c->cb, 2, 3, R_SPV, -16, 0);           /* the index */
+                t_cmni_enc(&c->cb, 1, t_modimm(1));
+                jc_fix(c, n, 1, CC_NE);
+                t_cmpi_enc(&c->cb, 3, 0);
+                jc_fix(c, n, 1, CC_NE);
+                t_ldst(&c->cb, LS_LDRH, R_IP, 0, offsetof(JSObject, class_id));
+                t_cmpi_enc(&c->cb, R_IP, JS_CLASS_ARRAY);
+                jc_fix(c, n, 1, CC_NE);
+                t_ldst(&c->cb, LS_LDR, R_IP, 0, offsetof(JSObject, u.array.count));
+                t_cmp(&c->cb, 2, R_IP);
+                jc_fix(c, n, 1, CC_HS);
+                t_ldst(&c->cb, LS_LDR, R_LR, 0, JIT_RC_OFF);
+                t_cmpi_enc(&c->cb, R_LR, 1);
+                jc_fix(c, n, 1, CC_LE);
+                t_dp_imm(&c->cb, DP_SUB, 0, R_LR, R_LR, t_modimm(1));
+                t_ldst(&c->cb, LS_STR, R_LR, 0, JIT_RC_OFF);
+                t_ldst(&c->cb, LS_LDR, R_IP, 0, offsetof(JSObject, u.array.u.values));
+                t_dp_reg(&c->cb, DP_ADD, 0, R_IP, R_IP, 2, SH_LSL, 3);
+                t_ldrd(&c->cb, 2, 3, R_IP, 0, 0);              /* the old value */
+                t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);            /* the new one */
+                t_strd(&c->cb, 0, 1, R_IP, 0, 0);
+                t_addi(&c->cb, R_SPV, R_SPV, -24);
+                jc_free23(c);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+
         /* properties, globals: through their caches */
         case OP_get_field: case OP_get_field2: case OP_get_length:
             jc_op_ic(c, pc, (void *)jit_get_field);
