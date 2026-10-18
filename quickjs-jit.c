@@ -2089,6 +2089,88 @@ static int jc_body(JitC *c)
             }
             break;
 
+        /* shifts (ints) */
+        case OP_shl: case OP_sar: case OP_shr:
+            {
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
+                t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);
+                t_dp_reg(&c->cb, DP_ORR, 1, R_IP, 1, 3, SH_LSL, 0);
+                jc_fix(c, n, 1, CC_NE);
+                t_dp_imm(&c->cb, DP_AND, 0, 2, 2, t_modimm(31));      /* and r2, #31 */
+                t_shr(&c->cb, op == OP_shl ? SH_LSL : op == OP_sar ? SH_ASR : SH_LSR,
+                      0, 0, 2);
+                if (op == OP_shr) {
+                    /* >>> above 2^31-1: a float, the slow way */
+                    t_cmpi_enc(&c->cb, 0, 0);
+                    jc_fix(c, n, 1, CC_LT);
+                }
+                t_ldst(&c->cb, LS_STR, 0, R_SPV, -16);
+                t_addi(&c->cb, R_SPV, R_SPV, -8);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+        case OP_post_inc: case OP_post_dec:
+            {
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);
+                t_cmpi_enc(&c->cb, 1, 0);
+                jc_fix(c, n, 1, CC_NE);
+                t_dp_imm(&c->cb, op == OP_post_inc ? DP_ADD : DP_SUB, 1, 0, 0,
+                         t_modimm(1));
+                jc_fix(c, n, 1, CC_VS);
+                jc_push01(c);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+        case OP_to_propkey:
+            {
+                /* an int already a key; anything else the slow way */
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldst(&c->cb, LS_LDR, 1, R_SPV, -4);
+                t_cmpi_enc(&c->cb, 1, 0);
+                jc_fix(c, n, 1, CC_NE);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+        case OP_is_undefined_or_null: case OP_is_undefined: case OP_is_null:
+            jc_pop23(c);
+            if (op == OP_is_undefined_or_null) {
+                t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 3, t_modimm(JS_TAG_NULL)); /* sub ip, r3, #2 */
+                t_cmpi_enc(&c->cb, R_IP, 1);
+                t_it(&c->cb, CC_LS, "te");
+                e16(&c->cb, 0x2001);                    /* mov r0, #1 */
+                e16(&c->cb, 0x2000);                    /* mov r0, #0 */
+            } else {
+                t_cmpi_enc(&c->cb, 3, op == OP_is_null ? JS_TAG_NULL : JS_TAG_UNDEFINED);
+                t_it(&c->cb, CC_EQ, "te");
+                e16(&c->cb, 0x2001);
+                e16(&c->cb, 0x2000);
+            }
+            e16(&c->cb, 0x2101);                        /* movs r1, #1 (bool) */
+            jc_push01(c);
+            jc_free23(c);
+            break;
+        case OP_lnot:
+            {
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);
+                t_cmpi_enc(&c->cb, 1, JS_TAG_UNDEFINED);
+                jc_fix(c, n, 1, CC_HI);
+                t_cmpi_enc(&c->cb, 0, 0);
+                t_it(&c->cb, CC_EQ, "te");
+                e16(&c->cb, 0x2001);
+                e16(&c->cb, 0x2000);
+                e16(&c->cb, 0x2101);
+                t_strd(&c->cb, 0, 1, R_SPV, -8, 0);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
+
         /* checked locals (let, const: not before their declaration) */
         case OP_get_loc_check:
             {
