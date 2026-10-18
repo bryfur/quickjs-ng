@@ -39,6 +39,9 @@
 static int qjs_jit_threshold = -1;      /* -1: not read yet; 0: off */
 static int qjs_jit_log;
 static int qjs_jit_direct = 1;      /* QJS_JIT_DIRECT=0: off */
+#if defined(__NuttX__)
+static int qjs_jit_psram;           /* QJS_JIT_PSRAM=1: code in the PSRAM too */
+#endif
 
 static const char *const jit_op_names[] = {
 #define FMT(f)
@@ -90,6 +93,10 @@ static void qjs_jit_config(void)
     qjs_jit_threshold = s ? atoi(s) : 8;
     s = getenv("QJS_JIT_LOG");
     qjs_jit_log = s && *s == '1';
+#if defined(__NuttX__)
+    s = getenv("QJS_JIT_PSRAM");
+    qjs_jit_psram = s && *s == '1';
+#endif
     s = getenv("QJS_JIT_DIRECT");
     qjs_jit_direct = !s || *s != '0';
     s = getenv("QJS_JIT_STATS");
@@ -108,8 +115,16 @@ void up_textheap_free(void *p);
 
 static void *jit_code_alloc(size_t size)
 {
-    /* the SRAM if the loader's allocator has room for it, else the PSRAM */
-    return up_textheap_memalign(".time_critical.qjsjit", 8, size);
+    /* the SRAM if the loader's allocator has room for it; not the PSRAM
+       unless asked: compiled code there, behind the 16 KB XIP cache, ran
+       slower than the interpreter's hot code in the SRAM (RayTrace 7149 ms
+       against 5466 on the board), so the function stays interpreted */
+    void *p = up_textheap_memalign(".time_critical.qjsjit", 8, size);
+    if (p && ((uintptr_t)p >> 28) != 2 && !qjs_jit_psram) {
+        up_textheap_free(p);
+        p = NULL;
+    }
+    return p;
 }
 
 static void jit_code_free(void *p, size_t size)
