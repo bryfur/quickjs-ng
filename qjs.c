@@ -238,6 +238,13 @@ static const JSCFunctionListEntry global_obj[] = {
 /* The embedder's own modules (QJS_INIT_EXTRA=name: void name(JSContext *)) */
 void QJS_INIT_EXTRA(JSContext *ctx);
 #endif
+#ifdef QJS_NAME_PROGRAM
+void QJS_NAME_PROGRAM(const char *script);
+#endif
+#ifdef QJS_MODULE_LOADER
+JSModuleDef *QJS_MODULE_LOADER(JSContext *ctx, const char *module_name,
+                               void *opaque, JSValueConst attributes);
+#endif
 
 static JSContext *JS_NewCustomContext(JSRuntime *rt)
 {
@@ -655,7 +662,12 @@ start:
     }
 
     /* loader for ES6 modules */
+#ifdef QJS_MODULE_LOADER
+    /* The embedder's module loader (its own modules, then quickjs-libc's) */
+    JS_SetModuleLoaderFunc2(rt, NULL, QJS_MODULE_LOADER, js_module_check_attributes, NULL);
+#else
     JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
+#endif
 
     /* exit on unhandled promise rejections */
     JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker, NULL);
@@ -717,6 +729,10 @@ start:
         } else {
             const char *filename;
             filename = argv[optind];
+#ifdef QJS_NAME_PROGRAM
+            /* The embedder names the program after its script */
+            QJS_NAME_PROGRAM(filename);
+#endif
             if (eval_file(ctx, filename, module))
                 goto fail;
         }
