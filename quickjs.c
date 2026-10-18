@@ -867,6 +867,11 @@ typedef struct JSFunctionBytecode {
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
     /* XXX: 5 bits available */
+#ifdef QJS_JIT
+    uint8_t jit_state;          /* JIT_STATE_* (quickjs-jit.c) */
+    uint32_t jit_hits;          /* calls (16 each) and backward jumps */
+    struct JSJitCode *jit;      /* the compiled code */
+#endif
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -18036,6 +18041,10 @@ static bool needs_backtrace(JSValue exc)
 }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+#ifdef QJS_JIT
+#include "quickjs-jit.h"
+#endif
+
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValueConst *argv, int flags)
@@ -18171,6 +18180,56 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
         print_func_name(b);
+#endif
+
+#ifdef QJS_JIT
+    /* the compiled code (quickjs-jit.c), from the start or a loop's head
+       (JIT_LOOP below): back here for an instruction it has not */
+    if (b->jit_state == JIT_STATE_DONE ||
+        (b->jit_state == JIT_STATE_NONE && qjs_jit_want(b, 16) &&
+         qjs_jit_compile(ctx, b) == 0)) {
+    jit_enter:
+        {
+            uintptr_t entry = qjs_jit_entry(b, pc);
+            if (entry) {
+                JSJitFrame jf;
+                int r;
+                jf.ctx = ctx;
+                jf.sf = sf;
+                jf.var_buf = var_buf;
+                jf.arg_buf = arg_buf;
+                jf.sp = sp;
+                jf.pc = pc;
+                jf.var_refs = var_refs;
+                jf.b = b;
+                jf.this_obj = this_obj;
+                jf.new_target = new_target;
+                jf.stack_buf = stack_buf;
+                jf.caller_ctx = caller_ctx;
+                jf.argc = argc;
+                jf.argv = (JSValue *)argv;
+                r = ((JSJitEnterFunc *)((uintptr_t)b->jit->code + 1))(&jf, entry);
+                sp = jf.sp;
+                pc = (uint8_t *)jf.pc;
+                if (r == JIT_RET) {
+                    ret_val = jf.ret;
+                    goto done;
+                }
+                if (r == JIT_EXC)
+                    goto exception;
+            }
+        }
+    }
+#define JIT_LOOP(diff)                                                  \
+    do {                                                                \
+        if ((diff) < 0 && b->func_kind == JS_FUNC_NORMAL &&             \
+            (b->jit_state == JIT_STATE_DONE ||                          \
+             (b->jit_state == JIT_STATE_NONE && qjs_jit_want(b, 1) &&   \
+              qjs_jit_compile(ctx, b) == 0)))                           \
+            goto jit_enter;                                             \
+    } while (0)
+#else
+#define JIT_LOOP(diff) do { } while (0)
 #endif
 
  restart:
@@ -19154,23 +19213,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t diff = (int32_t)get_u32(pc);
+                pc += diff;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                JIT_LOOP(diff);
+            }
             BREAK;
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int diff = (int16_t)get_u16(pc);
+                pc += diff;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                JIT_LOOP(diff);
+            }
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int diff = (int8_t)pc[0];
+                pc += diff;
+                if (unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+                JIT_LOOP(diff);
+            }
             BREAK;
         CASE(OP_if_true):
             {
-                int res;
+                int res, diff = 0;
                 JSValue op1;
 
                 op1 = sp[-1];
@@ -19182,15 +19253,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
+                JIT_LOOP(diff);
             }
             BREAK;
         CASE(OP_if_false):
             {
-                int res;
+                int res, diff = 0;
                 JSValue op1;
 
                 op1 = sp[-1];
@@ -19202,15 +19275,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
+                JIT_LOOP(diff);
             }
             BREAK;
         CASE(OP_if_true8):
             {
-                int res;
+                int res, diff = 0;
                 JSValue op1;
 
                 op1 = sp[-1];
@@ -19222,15 +19297,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
+                JIT_LOOP(diff);
             }
             BREAK;
         CASE(OP_if_false8):
             {
-                int res;
+                int res, diff = 0;
                 JSValue op1;
 
                 op1 = sp[-1];
@@ -19242,10 +19319,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
                 }
                 if (unlikely(js_poll_interrupts(ctx)))
                     goto exception;
+                JIT_LOOP(diff);
             }
             BREAK;
         CASE(OP_catch):
@@ -37172,6 +37251,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 {
+#ifdef QJS_JIT
+    qjs_jit_free(rt, b);
+#endif
     int i;
 
     if (b->byte_code_buf)
@@ -64941,3 +65023,7 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #undef malloc
 #undef free
 #undef realloc
+
+#ifdef QJS_JIT
+#include "quickjs-jit.c"
+#endif
