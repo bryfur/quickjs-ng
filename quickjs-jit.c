@@ -39,12 +39,39 @@
 static int qjs_jit_threshold = -1;      /* -1: not read yet; 0: off */
 static int qjs_jit_log;
 
+static const char *const jit_op_names[] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) #id,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef DEF
+#undef def
+#undef FMT
+};
+
+static void qjs_jit_print_stats(void)
+{
+    int i;
+    fprintf(stderr, "qjs jit: %u functions compiled, %u entries\n",
+            qjs_jit_nfunc, qjs_jit_nenter);
+    for (i = 0; i < 256; i++) {
+        if (qjs_jit_nop[i] || qjs_jit_nbail[i])
+            fprintf(stderr, "qjs jit: %-22s jit_op %9u  bail %9u\n",
+                    i < OP_COUNT ? jit_op_names[i] : "?",
+                    qjs_jit_nop[i], qjs_jit_nbail[i]);
+    }
+}
+
 static void qjs_jit_config(void)
 {
     const char *s = getenv("QJS_JIT");
     qjs_jit_threshold = s ? atoi(s) : 8;
     s = getenv("QJS_JIT_LOG");
     qjs_jit_log = s && *s == '1';
+    s = getenv("QJS_JIT_STATS");
+    qjs_jit_stats = s && *s == '1';
+    if (qjs_jit_stats)
+        atexit(qjs_jit_print_stats);
 }
 
 /* ---------------------------------------------------------------------
@@ -107,6 +134,7 @@ static void qjs_jit_free(JSRuntime *rt, JSFunctionBytecode *b)
     JSJitCode *jc = b->jit;
     if (jc) {
         jit_code_free(jc->code, jc->size);
+        js_free_rt(rt, jc->ics);
         js_free_rt(rt, jc);
         b->jit = NULL;
     }
@@ -151,6 +179,8 @@ static bool jit_op_has(int op)
     case OP_put_var_init:
     case OP_define_field: case OP_set_name: case OP_array_from:
     case OP_call: case OP_call_method: case OP_call_constructor:
+    case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+    case OP_tail_call: case OP_tail_call_method:
     case OP_apply:
     case OP_get_loc_check: case OP_put_loc_check: case OP_put_loc_check_init:
     case OP_get_var_ref_check: case OP_put_var_ref_check:
@@ -202,6 +232,8 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
 
     (void)arg_buf;
     sf->cur_pc = (uint8_t *)op_pc + short_opcode_info(opcode).size;
+    if (unlikely(qjs_jit_stats))
+        qjs_jit_nop[opcode]++;
 
     switch (opcode) {
     case OP_push_const:
@@ -289,6 +321,11 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
             break;
         case OP_SPECIAL_OBJECT_IMPORT_META:
             *sp++ = js_import_meta(ctx);
+            if (unlikely(JS_IsException(sp[-1])))
+                goto exception;
+            break;
+        case OP_SPECIAL_OBJECT_NULL_PROTO:
+            *sp++ = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_OBJECT);
             if (unlikely(JS_IsException(sp[-1])))
                 goto exception;
             break;
@@ -621,8 +658,11 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
         break;
 
     /* calls */
+    case OP_call0: case OP_call1: case OP_call2: case OP_call3:
     case OP_call:
-        call_argc = get_u16(pc);
+    case OP_tail_call:    /* (the compiled code returns the result) */
+        call_argc = opcode == OP_call || opcode == OP_tail_call ?
+                    get_u16(pc) : opcode - OP_call0;
         call_argv = sp - call_argc;
         ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                   JS_UNDEFINED, call_argc, vc(call_argv), 0);
@@ -634,6 +674,7 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
         *sp++ = ret_val;
         break;
     case OP_call_method:
+    case OP_tail_call_method:
         call_argc = get_u16(pc);
         call_argv = sp - call_argc;
         ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
@@ -1159,6 +1200,209 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
 }
 
 /* ---------------------------------------------------------------------
+ * Property caches: a get_field, get_field2, get_length, put_field, get_var
+ * or put_var site's guesses
+ *
+ *  - own: the slot (idx) the property had in the last object's shape:
+ *    right whenever that slot of the object's shape has the atom with the
+ *    flags wanted, whatever the shape (no shape identity needed);
+ *  - proto (get only): the receiver's shape (hashed: hash and pointer),
+ *    its prototype (holder) and the slot there: the receiver has no own
+ *    property of that name while its shape is that one;
+ *  - globals: the global object's slot, while the lexical globals' object
+ *    has the shape and property count it had (it only grows).
+ * --------------------------------------------------------------------- */
+
+typedef struct JitIC {
+    uint32_t idx;               /* own: the slot guessed */
+    JSShape *rshape;            /* proto: the receiver's shape */
+    uint32_t rhash;             /* ... its hash */
+    JSObject *holder;           /* ... its prototype */
+    JSShape *hshape;            /* ... the prototype's shape */
+    uint32_t hidx;              /* ... the slot there */
+} JitIC;
+
+static inline __attribute__((always_inline)) JSProperty *ic_slot(JSObject *p, uint32_t i, JSAtom atom,
+                                        int mask, int want)
+{
+    JSShape *sh = p->shape;
+    if (likely(i < (uint32_t)sh->prop_count)) {
+        JSShapeProperty *prs = get_shape_prop(sh) + i;
+        if (likely(prs->atom == atom && (prs->flags & mask) == want))
+            return &p->prop[i];
+    }
+    return NULL;
+}
+
+/* get_field, get_field2, get_length */
+static JSValue *jit_get_field(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
+                              JitIC *ic)
+{
+    JSContext *ctx = f->ctx;
+    int opcode = *op_pc;
+    JSAtom atom = opcode == OP_get_length ? JS_ATOM_length : get_u32(op_pc + 1);
+    JSValue obj = sp[-1], val;
+    JSObject *p, *p1;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        pr = ic_slot(p, ic->idx, atom, JS_PROP_TMASK, 0);
+        if (pr) {
+            val = js_dup(pr->u.value);
+            goto done;
+        }
+        if (p->shape == ic->rshape && p->shape->is_hashed &&
+            p->shape->hash == ic->rhash && p->shape->proto == ic->holder &&
+            ic->holder->shape == ic->hshape) {
+            pr = ic_slot(ic->holder, ic->hidx, atom, JS_PROP_TMASK, 0);
+            if (pr) {
+                val = js_dup(pr->u.value);
+                goto done;
+            }
+        }
+        /* the interpreter's way, the guesses updated */
+        p1 = p;
+        for (;;) {
+            prs = find_own_property(&pr, p1, atom);
+            if (prs) {
+                if (unlikely(prs->flags & JS_PROP_TMASK))
+                    goto slow;
+                val = js_dup(pr->u.value);
+                if (p1 == p) {
+                    ic->idx = prs - get_shape_prop(p->shape);
+                } else if (p1 == p->shape->proto && p->shape->is_hashed &&
+                           !p->is_exotic) {
+                    ic->rshape = p->shape;
+                    ic->rhash = p->shape->hash;
+                    ic->holder = p1;
+                    ic->hshape = p1->shape;
+                    ic->hidx = prs - get_shape_prop(p1->shape);
+                }
+                goto done;
+            }
+            if (unlikely(p1->is_exotic)) {
+                obj = JS_MKPTR(JS_TAG_OBJECT, p1);
+                goto slow;
+            }
+            p1 = p1->shape->proto;
+            if (!p1) {
+                val = JS_UNDEFINED;
+                goto done;
+            }
+        }
+    }
+ slow:
+    f->sf->cur_pc = (uint8_t *)op_pc + short_opcode_info(opcode).size;
+    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+    if (unlikely(JS_IsException(val))) {
+        f->sp = sp;
+        f->pc = op_pc + short_opcode_info(opcode).size;
+        return NULL;
+    }
+ done:
+    if (opcode == OP_get_field2) {
+        *sp++ = val;
+    } else {
+        JS_FreeValue(ctx, sp[-1]);
+        sp[-1] = val;
+    }
+    return sp;
+}
+
+static JSValue *jit_put_field(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
+                              JitIC *ic)
+{
+    JSContext *ctx = f->ctx;
+    JSAtom atom = get_u32(op_pc + 1);
+    JSValue obj = sp[-2];
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int ret;
+
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        pr = ic_slot(p, ic->idx, atom,
+                     JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH,
+                     JS_PROP_WRITABLE);
+        if (!pr) {
+            prs = find_own_property(&pr, p, atom);
+            if (prs && (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                      JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
+                ic->idx = prs - get_shape_prop(p->shape);
+            else
+                pr = NULL;
+        }
+        if (pr) {
+            set_value(ctx, &pr->u.value, sp[-1]);
+            JS_FreeValue(ctx, obj);
+            return sp - 2;
+        }
+    }
+    f->sf->cur_pc = (uint8_t *)op_pc + 5;
+    ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
+                                  JS_PROP_THROW_STRICT);
+    JS_FreeValue(ctx, obj);
+    sp -= 2;
+    if (unlikely(ret < 0)) {
+        f->sp = sp;
+        f->pc = op_pc + 5;
+        return NULL;
+    }
+    return sp;
+}
+
+/* get_var, get_var_undef: global variables (JS_GetGlobalVar()) */
+static JSValue *jit_get_var(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
+                            JitIC *ic)
+{
+    JSContext *ctx = f->ctx;
+    JSAtom atom = get_u32(op_pc + 1);
+    JSObject *gvo = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    JSObject *go = JS_VALUE_GET_OBJ(ctx->global_obj);
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSValue val;
+
+    /* a lexical global (let, const, class at the top level) */
+    pr = ic_slot(gvo, ic->idx, atom, 0, 0);
+    if (pr && !JS_IsUninitialized(pr->u.value)) {
+        *sp++ = js_dup(pr->u.value);
+        return sp;
+    }
+    /* a property of the global object, none of that name in gvo */
+    if (gvo->shape == ic->rshape && (uint32_t)gvo->shape->prop_count == ic->rhash) {
+        pr = ic_slot(go, ic->hidx, atom, JS_PROP_TMASK, 0);
+        if (pr) {
+            *sp++ = js_dup(pr->u.value);
+            return sp;
+        }
+    }
+    prs = find_own_property(&pr, gvo, atom);
+    if (prs) {
+        ic->idx = prs - get_shape_prop(gvo->shape);
+    } else {
+        prs = find_own_property(&pr, go, atom);
+        if (prs && (prs->flags & JS_PROP_TMASK) == 0) {
+            ic->rshape = gvo->shape;
+            ic->rhash = gvo->shape->prop_count;
+            ic->hidx = prs - get_shape_prop(go->shape);
+        }
+    }
+    f->sf->cur_pc = (uint8_t *)op_pc + 5;
+    val = JS_GetGlobalVar(ctx, atom, *op_pc - OP_get_var_undef);
+    if (unlikely(JS_IsException(val))) {
+        f->sp = sp;
+        f->pc = op_pc + 5;
+        return NULL;
+    }
+    *sp++ = val;
+    return sp;
+}
+
+/* ---------------------------------------------------------------------
  * The compiler
  * --------------------------------------------------------------------- */
 
@@ -1207,6 +1451,8 @@ typedef struct {
     uint32_t nfix, cfix;
     JitStub *stub;
     uint32_t nstub, cstub;
+    struct JitIC *ics;          /* the property caches (one a site) */
+    uint32_t nics;
     uint32_t exc_exit;          /* code offset of the exception exit */
     uint32_t ret_exit;          /* ... of the return exit (f->ret set) */
     bool fail;
@@ -1387,6 +1633,19 @@ static void jc_op(JitC *c, uint32_t pc)
     t_mov(&c->cb, 1, R_SPV);
     t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
     jc_call(c, (void *)jit_op);
+    e16(&c->cb, 0x0004);                            /* movs r4, r0 */
+    jc_fix(c, c->exc_exit, 2, CC_EQ);
+}
+
+/* the instruction at pc run by fn(f, sp, pc, its property cache) */
+static void jc_op_ic(JitC *c, uint32_t pc, void *fn)
+{
+    struct JitIC *ic = &c->ics[c->nics++];
+    t_mov(&c->cb, 0, R_F);
+    t_mov(&c->cb, 1, R_SPV);
+    t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
+    t_movi(&c->cb, 3, (uint32_t)(uintptr_t)ic);
+    jc_call(c, fn);
     e16(&c->cb, 0x0004);                            /* movs r4, r0 */
     jc_fix(c, c->exc_exit, 2, CC_EQ);
 }
@@ -1651,7 +1910,7 @@ static int jc_body(JitC *c)
                     jc_cold(c, CC_NE, STUB_OP, pc);
                     uint32_t n = c->nstub - 1;
                     t_cmp(&c->cb, 0, 2);
-                    t_it(&c->cb, cc, "e");
+                    t_it(&c->cb, cc, "te");               /* ite cc */
                     e16(&c->cb, 0x2001);                /* mov r0, #1 */
                     e16(&c->cb, 0x2000);                /* mov r0, #0 */
                     e16(&c->cb, 0x2101);                /* movs r1, #1 (JS_TAG_BOOL) */
@@ -1707,6 +1966,33 @@ static int jc_body(JitC *c)
             }
             break;
 
+        /* properties, globals: through their caches */
+        case OP_get_field: case OP_get_field2: case OP_get_length:
+            jc_op_ic(c, pc, (void *)jit_get_field);
+            break;
+        case OP_put_field:
+            jc_op_ic(c, pc, (void *)jit_put_field);
+            break;
+        case OP_get_var: case OP_get_var_undef:
+            jc_op_ic(c, pc, (void *)jit_get_var);
+            break;
+        case OP_push_this:
+            /* (only at a function's start: the frame's this) */
+            t_ldrd(&c->cb, 0, 1, R_F, offsetof(JSJitFrame, this_obj), 0);
+            if (!b->is_strict_mode) {
+                uint32_t n;
+                t_cmni_enc(&c->cb, 1, t_modimm(1));     /* cmn r1, #1: an object */
+                jc_cold(c, CC_NE, STUB_OP, pc);
+                n = c->nstub - 1;
+                jc_dup01(c);
+                jc_push01(c);
+                c->stub[n].back = c->cb.len;            /* (after the push) */
+            } else {
+                jc_dup01(c);
+                jc_push01(c);
+            }
+            break;
+
         /* returns */
         case OP_return:
             jc_pop01(c);
@@ -1716,6 +2002,14 @@ static int jc_body(JitC *c)
         case OP_return_undef:
             t_movi(&c->cb, 0, 0);
             t_movi(&c->cb, 1, JS_TAG_UNDEFINED);
+            t_strd(&c->cb, 0, 1, R_F, F_RET, 0);
+            jc_fix(c, c->ret_exit, 2, CC_AL);
+            break;
+
+        case OP_tail_call:
+        case OP_tail_call_method:
+            jc_op(c, pc);
+            jc_pop01(c);
             t_strd(&c->cb, 0, 1, R_F, F_RET, 0);
             jc_fix(c, c->ret_exit, 2, CC_AL);
             break;
@@ -1774,6 +2068,19 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
 
     pos_body = c.cb.len;
     (void)pos_body;
+    {
+        uint32_t pc, n_ic = 0;
+        for (pc = 0; pc < len; pc += short_opcode_info(b->byte_code_buf[pc]).size) {
+            switch (b->byte_code_buf[pc]) {
+            case OP_get_field: case OP_get_field2: case OP_get_length:
+            case OP_put_field: case OP_get_var: case OP_get_var_undef:
+                n_ic++;
+            }
+        }
+        c.ics = js_mallocz(ctx, (n_ic + 1) * sizeof(*c.ics));
+        if (!c.ics)
+            goto done;
+    }
     if (jc_body(&c) < 0)
         goto done;
 
@@ -1871,6 +2178,8 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     jit_code_sync(mem, c.cb.len);
     jc->code = mem;
     jc->size = c.cb.len;
+    jc->ics = c.ics;
+    c.ics = NULL;
     jc->nentries = n;
     for (n = 0, i = 0; i < len; i++) {
         if (c.is_target[i]) {
@@ -1903,6 +2212,7 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     free(c.fix);
     free(c.stub);
     free(c.cb.buf);
+    js_free(ctx, c.ics);
     return jc;
 }
 
@@ -1914,6 +2224,7 @@ static int qjs_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
         return -1;
     }
     b->jit = jc_compile(ctx, b);
+    qjs_jit_nfunc += b->jit != NULL;
     b->jit_state = b->jit ? JIT_STATE_DONE : JIT_STATE_FAILED;
     return b->jit ? 0 : -1;
 }

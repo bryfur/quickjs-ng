@@ -18208,6 +18208,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 jf.caller_ctx = caller_ctx;
                 jf.argc = argc;
                 jf.argv = (JSValue *)argv;
+                if (unlikely(qjs_jit_stats))
+                    qjs_jit_nenter++;
                 r = ((JSJitEnterFunc *)((uintptr_t)b->jit->code + 1))(&jf, entry);
                 sp = jf.sp;
                 pc = (uint8_t *)jf.pc;
@@ -18217,6 +18219,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 if (r == JIT_EXC)
                     goto exception;
+                if (unlikely(qjs_jit_stats))
+                    qjs_jit_nbail[*pc]++;
             }
         }
     }
