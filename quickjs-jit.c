@@ -1297,6 +1297,14 @@ typedef struct JitIC {
     JSObject *holder;           /* ... its prototype */
     JSShape *hshape;            /* ... the prototype's shape */
     uint32_t hidx;              /* ... the slot there */
+    /* a second receiver shape (a site that sees two: subclasses), checked
+       in C; the older of the two replaced */
+    JSShape *rshape2;
+    uint32_t rhash2;
+    JSObject *holder2;
+    JSShape *hshape2;
+    uint32_t hidx2;
+    uint8_t next;               /* the entry to replace next */
 } JitIC;
 
 static inline __attribute__((always_inline)) JSProperty *ic_slot(JSObject *p, uint32_t i, JSAtom atom,
@@ -1341,6 +1349,15 @@ static JSValue *jit_get_field(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
                 goto done;
             }
         }
+        if (p->shape == ic->rshape2 && p->shape->is_hashed &&
+            p->shape->hash == ic->rhash2 && p->shape->proto == ic->holder2 &&
+            ic->holder2->shape == ic->hshape2) {
+            pr = ic_slot(ic->holder2, ic->hidx2, atom, JS_PROP_TMASK, 0);
+            if (pr) {
+                val = js_dup(pr->u.value);
+                goto done;
+            }
+        }
         /* the interpreter's way, the guesses updated */
         p1 = p;
         for (;;) {
@@ -1353,11 +1370,20 @@ static JSValue *jit_get_field(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc,
                     ic->idx = prs - get_shape_prop(p->shape);
                 } else if (p1 == p->shape->proto && p->shape->is_hashed &&
                            !p->is_exotic) {
-                    ic->rshape = p->shape;
-                    ic->rhash = p->shape->hash;
-                    ic->holder = p1;
-                    ic->hshape = p1->shape;
-                    ic->hidx = prs - get_shape_prop(p1->shape);
+                    if (ic->next == 0) {
+                        ic->rshape = p->shape;
+                        ic->rhash = p->shape->hash;
+                        ic->holder = p1;
+                        ic->hshape = p1->shape;
+                        ic->hidx = prs - get_shape_prop(p1->shape);
+                    } else {
+                        ic->rshape2 = p->shape;
+                        ic->rhash2 = p->shape->hash;
+                        ic->holder2 = p1;
+                        ic->hshape2 = p1->shape;
+                        ic->hidx2 = prs - get_shape_prop(p1->shape);
+                    }
+                    ic->next ^= 1;
                 }
                 goto done;
             }
