@@ -1199,6 +1199,83 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
     return NULL;
 }
 
+/* The slow way of an inline arithmetic or comparison (its int path
+   failed): numbers (int, float or both) done here, at less cost than
+   jit_op()'s; anything else there */
+static JSValue *jit_arith(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
+{
+    JSValue op1 = sp[-2], op2 = sp[-1];
+    double d1, d2, r;
+    int opcode = *op_pc;
+
+    if (!js_arith_to_float64(op1, &d1) || !js_arith_to_float64(op2, &d2))
+        return jit_op(f, sp, op_pc);
+    switch (opcode) {
+    case OP_add: r = d1 + d2; break;
+    case OP_sub: r = d1 - d2; break;
+    case OP_mul: r = d1 * d2; break;
+    case OP_div: sp[-2] = js_number(d1 / d2); return sp - 1;
+    case OP_lt:  sp[-2] = js_bool(d1 < d2); return sp - 1;
+    case OP_lte: sp[-2] = js_bool(d1 <= d2); return sp - 1;
+    case OP_gt:  sp[-2] = js_bool(d1 > d2); return sp - 1;
+    case OP_gte: sp[-2] = js_bool(d1 >= d2); return sp - 1;
+    case OP_eq: case OP_strict_eq:   sp[-2] = js_bool(d1 == d2); return sp - 1;
+    case OP_neq: case OP_strict_neq: sp[-2] = js_bool(d1 != d2); return sp - 1;
+    default: return jit_op(f, sp, op_pc);
+    }
+    sp[-2] = js_float64(r);
+    return sp - 1;
+}
+
+static bool jit_is_arith(int op)
+{
+    switch (op) {
+    case OP_add: case OP_sub: case OP_mul: case OP_div:
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+    case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* call, call0..call3, call_method, tail_call, tail_call_method */
+static JSValue *jit_call(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
+{
+    JSContext *ctx = f->ctx;
+    int opcode = *op_pc, argc, i, method;
+    JSValue *argv, ret;
+
+    switch (opcode) {
+    case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+        argc = opcode - OP_call0;
+        method = 0;
+        break;
+    case OP_call_method: case OP_tail_call_method:
+        argc = get_u16(op_pc + 1);
+        method = 1;
+        break;
+    default:
+        argc = get_u16(op_pc + 1);
+        method = 0;
+        break;
+    }
+    argv = sp - argc;
+    f->sf->cur_pc = (uint8_t *)op_pc + short_opcode_info(opcode).size;
+    ret = JS_CallInternal(ctx, argv[-1], method ? argv[-2] : JS_UNDEFINED,
+                          JS_UNDEFINED, argc, vc(argv), 0);
+    if (unlikely(JS_IsException(ret))) {
+        f->sp = sp;
+        f->pc = op_pc + short_opcode_info(opcode).size;
+        return NULL;
+    }
+    for (i = -1 - method; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    sp -= argc + 1 + method;
+    *sp++ = ret;
+    return sp;
+}
+
 /* ---------------------------------------------------------------------
  * Property caches: a get_field, get_field2, get_length, put_field, get_var
  * or put_var site's guesses
@@ -1632,7 +1709,19 @@ static void jc_op(JitC *c, uint32_t pc)
     t_mov(&c->cb, 0, R_F);
     t_mov(&c->cb, 1, R_SPV);
     t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
-    jc_call(c, (void *)jit_op);
+    jc_call(c, jit_is_arith(c->b->byte_code_buf[pc]) ? (void *)jit_arith :
+                                                        (void *)jit_op);
+    e16(&c->cb, 0x0004);                            /* movs r4, r0 */
+    jc_fix(c, c->exc_exit, 2, CC_EQ);
+}
+
+/* the instruction at pc run by fn(f, sp, pc) */
+static void jc_op_fn(JitC *c, uint32_t pc, void *fn)
+{
+    t_mov(&c->cb, 0, R_F);
+    t_mov(&c->cb, 1, R_SPV);
+    t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
+    jc_call(c, fn);
     e16(&c->cb, 0x0004);                            /* movs r4, r0 */
     jc_fix(c, c->exc_exit, 2, CC_EQ);
 }
@@ -1903,38 +1992,72 @@ static int jc_body(JitC *c)
                 int cc = jc_cmp_cc(op);
                 bool fuse = next_free && (next == OP_if_false || next == OP_if_true ||
                                           next == OP_if_false8 || next == OP_if_true8);
+                uint32_t n = jc_stub(c, STUB_OP, CC_NE, pc, 0);
                 t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
                 t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);
-                t_dp_reg(&c->cb, DP_ORR, 1, R_IP, 1, 3, SH_LSL, 0);
+                t_dp_reg(&c->cb, DP_ORR, 1, R_IP, 1, 3, SH_LSL, 0);  /* orrs ip, r1, r3 */
+                if (cc == CC_EQ || cc == CC_NE) {
+                    /* ==, !=, ===, !==: both ints, or both objects (the
+                       same one?), bools, nulls or undefineds: their
+                       payloads compared; else the slow way */
+                    uint32_t p1, p2, p3;
+                    p1 = c->cb.len;
+                    e32(&c->cb, 0, 0);                  /* beq.w: both ints */
+                    t_cmp(&c->cb, 1, 3);
+                    jc_fix(c, n, 1, CC_NE);
+                    t_dp_imm(&c->cb, DP_ADD, 1, R_IP, 1, t_modimm(1)); /* adds ip, r1, #1 */
+                    p2 = c->cb.len;
+                    e32(&c->cb, 0, 0);                  /* bne.w: not objects */
+                    /* two objects: the comparison drops a reference to
+                       each; inline only when neither goes (a count above 2) */
+                    t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
+                    t_cmpi_enc(&c->cb, R_IP, 2);
+                    jc_fix(c, n, 1, CC_LE);
+                    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF);
+                    t_cmpi_enc(&c->cb, R_LR, 2);
+                    jc_fix(c, n, 1, CC_LE);
+                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
+                    t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
+                    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF); /* (the same one?) */
+                    t_dp_imm(&c->cb, DP_SUB, 0, R_LR, R_LR, t_modimm(1));
+                    t_ldst(&c->cb, LS_STR, R_LR, 2, JIT_RC_OFF);
+                    p3 = c->cb.len;
+                    e32(&c->cb, 0, 0);                  /* b.w: compare */
+                    t_bcc_at(&c->cb, p2, CC_NE, (int32_t)(c->cb.len - p2));
+                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 1, t_modimm(1)); /* sub ip, r1, #1 */
+                    t_cmpi_enc(&c->cb, R_IP, 2);        /* bool, null, undefined */
+                    jc_fix(c, n, 1, CC_HI);
+                    t_bcc_at(&c->cb, p1, CC_EQ, (int32_t)(c->cb.len - p1));
+                    t_b_at(&c->cb, p3, (int32_t)(c->cb.len - p3), false);
+                } else {
+                    jc_fix(c, n, 1, CC_NE);
+                }
+                t_cmp(&c->cb, 0, 2);
                 if (!fuse) {
-                    jc_cold(c, CC_NE, STUB_OP, pc);
-                    uint32_t n = c->nstub - 1;
-                    t_cmp(&c->cb, 0, 2);
-                    t_it(&c->cb, cc, "te");               /* ite cc */
+                    t_it(&c->cb, cc, "te");             /* ite cc */
                     e16(&c->cb, 0x2001);                /* mov r0, #1 */
                     e16(&c->cb, 0x2000);                /* mov r0, #0 */
                     e16(&c->cb, 0x2101);                /* movs r1, #1 (JS_TAG_BOOL) */
                     t_strd(&c->cb, 0, 1, R_SPV, -16, 0);
                     t_addi(&c->cb, R_SPV, R_SPV, -8);
-                    c->stub[n].back = c->cb.len;
+                    if (!c->fail)
+                        c->stub[n].back = c->cb.len;
                 } else {
                     /* compare and jump: the slow way runs the comparison in
-                       jit_op() and goes on with the jump's own code */
+                       C and goes on with the jump's own code */
                     uint32_t npc = pc + size;
                     const uint8_t *na = bc + npc + 1;
                     int32_t target = next == OP_if_false || next == OP_if_true ?
                         (int32_t)(npc + 1 + (int32_t)get_u32(na)) :
                         (int32_t)(npc + 1 + (int8_t)na[0]);
                     bool on_true = next == OP_if_true || next == OP_if_true8;
-                    uint32_t n = jc_stub(c, STUB_OP, CC_NE, pc, 0);
-                    jc_fix(c, n, 1, CC_NE);
-                    t_cmp(&c->cb, 0, 2);
                     t_addi(&c->cb, R_SPV, R_SPV, -16);
                     jc_jump(c, on_true ? cc : CC_INV(cc), npc, target);
                     jc_fix(c, npc + short_opcode_info(next).size, 0, CC_AL);
-                    /* the slow comparison comes back to the jump */
-                    c->stub[n].back = 0xffffffff;
-                    c->stub[n].target = npc;
+                    if (!c->fail) {
+                        c->stub[n].back = 0xffffffff;
+                        c->stub[n].target = npc;
+                    }
                 }
             }
             break;
@@ -2006,9 +2129,13 @@ static int jc_body(JitC *c)
             jc_fix(c, c->ret_exit, 2, CC_AL);
             break;
 
+        case OP_call: case OP_call_method:
+        case OP_call0: case OP_call1: case OP_call2: case OP_call3:
+            jc_op_fn(c, pc, (void *)jit_call);
+            break;
         case OP_tail_call:
         case OP_tail_call_method:
-            jc_op(c, pc);
+            jc_op_fn(c, pc, (void *)jit_call);
             jc_pop01(c);
             t_strd(&c->cb, 0, 1, R_F, F_RET, 0);
             jc_fix(c, c->ret_exit, 2, CC_AL);
@@ -2247,6 +2374,8 @@ static uintptr_t qjs_jit_entry(JSFunctionBytecode *b, const uint8_t *pc)
     JSJitCode *jc = b->jit;
     uint32_t bc = pc - b->byte_code_buf;
     uint32_t lo = 0, hi = jc->nentries;
+    if (bc == 0)                /* (the start: entries[0]) */
+        return (uintptr_t)jc->code + jc->entries[0].nat + 1;
     while (lo < hi) {
         uint32_t mid = (lo + hi) / 2;
         if (jc->entries[mid].bc < bc)
