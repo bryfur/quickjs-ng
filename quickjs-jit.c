@@ -1579,6 +1579,7 @@ enum {
     STUB_BAIL,      /* the interpreter goes on at pc */
     STUB_BOOL,      /* jit_to_bool(ctx, r2:r3): taken (target) or back */
     STUB_POLL,      /* the interrupt counter ran out: poll, then target */
+    STUB_GETF,      /* jit_get_field(f, sp, pc, ic: target), then back */
 };
 
 typedef struct {
@@ -1810,6 +1811,56 @@ static void jc_op_ic(JitC *c, uint32_t pc, void *fn)
     jc_call(c, fn);
     e16(&c->cb, 0x0004);                            /* movs r4, r0 */
     jc_fix(c, c->exc_exit, 2, CC_EQ);
+}
+
+/* get_field, get_field2 inline when the cache's own slot is right (the
+   object's shape has the atom there, a plain data property); else
+   jit_get_field() in a stub, which also updates the cache */
+static void jc_get_field_inline(JitC *c, uint32_t pc, int op)
+{
+    struct JitIC *ic = &c->ics[c->nics++];
+    JSAtom atom = get_u32(c->b->byte_code_buf + pc + 1);
+    uint32_t n = jc_stub(c, STUB_GETF, 0, pc, (uint32_t)(uintptr_t)ic);
+
+    t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);                 /* the object */
+    t_cmni_enc(&c->cb, 1, t_modimm(1));
+    jc_fix(c, n, 1, CC_NE);
+    t_ldst(&c->cb, LS_LDR, 2, 0, offsetof(JSObject, shape));
+    t_movi(&c->cb, R_IP, (uint32_t)(uintptr_t)ic);
+    t_ldst(&c->cb, LS_LDR, 3, R_IP, offsetof(struct JitIC, idx));
+    t_ldst(&c->cb, LS_LDR, R_LR, 2, offsetof(JSShape, prop_count));
+    t_cmp(&c->cb, 3, R_LR);
+    jc_fix(c, n, 1, CC_HS);
+    /* &prop[i]: sh->hash_table + mask + 1, then 8 bytes a property */
+    t_ldst(&c->cb, LS_LDR, R_LR, 2, offsetof(JSShape, prop_hash_mask));
+    t_dp_reg(&c->cb, DP_ADD, 0, R_LR, 2, R_LR, SH_LSL, 2);
+    t_addi(&c->cb, R_LR, R_LR, offsetof(JSShape, hash_table) + 4);
+    t_dp_reg(&c->cb, DP_ADD, 0, R_LR, R_LR, 3, SH_LSL, 3);
+    t_ldst(&c->cb, LS_LDR, R_IP, R_LR, offsetof(JSShapeProperty, atom));
+    t_movi(&c->cb, 2, atom);
+    t_cmp(&c->cb, R_IP, 2);
+    jc_fix(c, n, 1, CC_NE);
+    t_ldst(&c->cb, LS_LDR, R_IP, R_LR, 0);              /* hash_next:26, flags:6 */
+    t_dp_imm(&c->cb, DP_AND, 1, R_IP, R_IP, t_modimm((uint32_t)JS_PROP_TMASK << 26));
+    jc_fix(c, n, 1, CC_NE);
+    if (op == OP_get_field) {
+        /* the object's reference goes: not its last one */
+        t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
+        t_cmpi_enc(&c->cb, R_IP, 1);
+        jc_fix(c, n, 1, CC_LE);
+        t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
+        t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
+    }
+    t_ldst(&c->cb, LS_LDR, R_LR, 0, offsetof(JSObject, prop));
+    t_dp_reg(&c->cb, DP_ADD, 0, R_LR, R_LR, 3, SH_LSL, 3);
+    t_ldrd(&c->cb, 0, 1, R_LR, 0, 0);
+    jc_dup01(c);
+    if (op == OP_get_field)
+        t_strd(&c->cb, 0, 1, R_SPV, -8, 0);
+    else
+        jc_push01(c);
+    if (!c->fail)
+        c->stub[n].back = c->cb.len;
 }
 
 /* a jump to bytecode offset target (cond); backward: the interrupt
@@ -2343,7 +2394,10 @@ static int jc_body(JitC *c)
             break;
 
         /* properties, globals: through their caches */
-        case OP_get_field: case OP_get_field2: case OP_get_length:
+        case OP_get_field: case OP_get_field2:
+            jc_get_field_inline(c, pc, op);
+            break;
+        case OP_get_length:
             jc_op_ic(c, pc, (void *)jit_get_field);
             break;
         case OP_put_field:
@@ -2555,6 +2609,16 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
                 jc_fix(&c, s->target, 0, CC_AL);    /* to the jump's code */
             else
                 jc_fix(&c, s->back, 2, CC_AL);
+            break;
+        case STUB_GETF:
+            t_mov(&c.cb, 0, R_F);
+            t_mov(&c.cb, 1, R_SPV);
+            t_movi(&c.cb, 2, (uint32_t)(uintptr_t)(b->byte_code_buf + s->pc));
+            t_movi(&c.cb, 3, s->target);
+            jc_call(&c, (void *)jit_get_field);
+            e16(&c.cb, 0x0004);                     /* movs r4, r0 */
+            jc_fix(&c, c.exc_exit, 2, CC_EQ);
+            jc_fix(&c, s->back, 2, CC_AL);
             break;
         case STUB_FREE:
             t_mov(&c.cb, 0, R_CTX);
