@@ -38,6 +38,7 @@
 
 static int qjs_jit_threshold = -1;      /* -1: not read yet; 0: off */
 static int qjs_jit_log;
+static int qjs_jit_direct = 1;      /* QJS_JIT_DIRECT=0: off */
 
 static const char *const jit_op_names[] = {
 #define FMT(f)
@@ -49,11 +50,32 @@ static const char *const jit_op_names[] = {
 #undef FMT
 };
 
+/* QJS_JIT_STATS: why an array element went the slow way (get 0, put 1):
+   not an object or not an int index, not a fast array, past its end,
+   one past its end (an append) */
+static uint32_t jit_el_miss[2][4];
+static void jit_el_why(JSValueConst o, JSValueConst i, int put)
+{
+    if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(i) != JS_TAG_INT)
+        jit_el_miss[put][0]++;
+    else if (JS_VALUE_GET_OBJ(o)->class_id != JS_CLASS_ARRAY ||
+             !JS_VALUE_GET_OBJ(o)->fast_array)
+        jit_el_miss[put][1]++;
+    else if ((uint32_t)JS_VALUE_GET_INT(i) == JS_VALUE_GET_OBJ(o)->u.array.count)
+        jit_el_miss[put][3]++;
+    else
+        jit_el_miss[put][2]++;
+}
+
 static void qjs_jit_print_stats(void)
 {
     int i;
-    fprintf(stderr, "qjs jit: %u functions compiled, %u entries\n",
-            qjs_jit_nfunc, qjs_jit_nenter);
+    for (i = 0; i < 2; i++)
+        fprintf(stderr, "qjs jit: %s_array_el slow: type %u, not fast %u, past end %u, append %u\n",
+                i ? "put" : "get", jit_el_miss[i][0], jit_el_miss[i][1],
+                jit_el_miss[i][2], jit_el_miss[i][3]);
+    fprintf(stderr, "qjs jit: %u functions compiled, %u entries, %u direct calls\n",
+            qjs_jit_nfunc, qjs_jit_nenter, qjs_jit_ndirect);
     for (i = 0; i < 256; i++) {
         if (qjs_jit_nop[i] || qjs_jit_nbail[i])
             fprintf(stderr, "qjs jit: %-22s jit_op %9u  bail %9u\n",
@@ -68,6 +90,8 @@ static void qjs_jit_config(void)
     qjs_jit_threshold = s ? atoi(s) : 8;
     s = getenv("QJS_JIT_LOG");
     qjs_jit_log = s && *s == '1';
+    s = getenv("QJS_JIT_DIRECT");
+    qjs_jit_direct = !s || *s != '0';
     s = getenv("QJS_JIT_STATS");
     qjs_jit_stats = s && *s == '1';
     if (qjs_jit_stats)
@@ -531,6 +555,8 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
     case OP_get_array_el2:
         {
             JSValue val;
+            if (unlikely(qjs_jit_stats))
+                jit_el_why(sp[-2], sp[-1], 0);
             if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
                        JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                 JSObject *p1 = JS_VALUE_GET_OBJ(sp[-2]);
@@ -568,6 +594,8 @@ static JSValue *jit_op(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
         }
         break;
     case OP_put_array_el:
+        if (unlikely(qjs_jit_stats))
+            jit_el_why(sp[-3], sp[-2], 1);
         {
             int ret;
             JSValue val = sp[-1];
@@ -1240,6 +1268,104 @@ static bool jit_is_arith(int op)
 }
 
 /* call, call0..call3, call_method, tail_call, tail_call_method */
+/* A call from compiled code to a compiled function whose code never hands
+   back to the interpreter (JSJitCode.direct: no bail, nothing caught):
+   JS_CallInternal()'s frame set up and its epilogue, without its own big
+   frame (372 bytes at -Os) or its dispatch.  As JS_CallInternal(ctx, p,
+   this_obj, new_target, argc, argv, ctor ? JS_CALL_FLAG_CONSTRUCTOR : 0). */
+static JSValue jit_call_direct(JSContext *caller_ctx, JSObject *p,
+                               JSValueConst this_obj, JSValueConst new_target,
+                               int argc, JSValue *argv, bool ctor)
+{
+    JSRuntime *rt = caller_ctx->rt;
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSContext *ctx;
+    JSStackFrame sf_s, *sf = &sf_s;
+    JSValue *local_buf, *arg_buf, *var_buf, *stack_buf, *pval, ret_val;
+    int arg_allocated_size, i, r;
+    size_t alloca_size;
+    JSJitFrame jf;
+
+    if (js_poll_interrupts(caller_ctx))
+        return JS_EXCEPTION;
+    arg_allocated_size = argc < b->arg_count ? b->arg_count : 0;
+    alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
+                                     b->stack_size) +
+        sizeof(JSVarRef *) * b->var_ref_count;
+    if (js_check_stack_overflow(rt, alloca_size))
+        return JS_ThrowStackOverflow(caller_ctx);
+    if (unlikely(qjs_jit_stats))
+        qjs_jit_ndirect++;
+
+    sf->is_strict_mode = b->is_strict_mode;
+    sf->is_constructor = ctor;
+    arg_buf = argv;
+    sf->arg_count = argc;
+    sf->cur_func = JS_MKPTR(JS_TAG_OBJECT, p);
+    local_buf = alloca(alloca_size);
+    if (unlikely(arg_allocated_size)) {
+        arg_buf = local_buf;
+        for (i = 0; i < argc; i++)
+            arg_buf[i] = js_dup(argv[i]);
+        for (; i < b->arg_count; i++)
+            arg_buf[i] = JS_UNDEFINED;
+        sf->arg_count = b->arg_count;
+    }
+    var_buf = local_buf + arg_allocated_size;
+    sf->var_buf = var_buf;
+    sf->arg_buf = arg_buf;
+    for (i = 0; i < b->var_count; i++)
+        var_buf[i] = JS_UNDEFINED;
+    stack_buf = var_buf + b->var_count;
+    sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
+    sf->var_ref_count = b->var_ref_count;
+    for (i = 0; i < b->var_ref_count; i++)
+        sf->var_refs[i] = NULL;
+    sf->cur_gc_obj = NULL;
+    sf->cur_sp = NULL;
+    sf->cur_pc = NULL;
+    sf->prev_frame = rt->current_stack_frame;
+    rt->current_stack_frame = sf;
+    ctx = b->realm;
+
+    jf.ctx = ctx;
+    jf.sf = sf;
+    jf.var_buf = var_buf;
+    jf.arg_buf = arg_buf;
+    jf.sp = stack_buf;
+    jf.pc = b->byte_code_buf;
+    jf.var_refs = p->u.func.var_refs;
+    jf.b = b;
+    jf.this_obj = unsafe_unconst(this_obj);
+    jf.new_target = unsafe_unconst(new_target);
+    jf.stack_buf = stack_buf;
+    jf.caller_ctx = caller_ctx;
+    jf.argc = argc;
+    jf.argv = argv;
+    r = ((JSJitEnterFunc *)((uintptr_t)b->jit->code + 1))
+            (&jf, (uintptr_t)b->jit->code + b->jit->entries[0].nat + 1);
+    if (likely(r == JIT_RET)) {
+        ret_val = jf.ret;
+    } else {
+        /* JIT_EXC (a direct function has no JIT_BAIL): nothing in it
+           catches, so the exception just leaves, as the interpreter's
+           exception path would with nothing caught */
+        if (needs_backtrace(rt->current_exception)
+        || JS_IsUndefined(ctx->error_back_trace)) {
+            sf->cur_pc = (uint8_t *)jf.pc;
+            build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
+                            NULL, 0, 0, 0);
+        }
+        ret_val = JS_EXCEPTION;
+    }
+    if (unlikely(sf->var_ref_count != 0))
+        close_var_refs(rt, sf);
+    for (pval = local_buf; pval < jf.sp; pval++)
+        JS_FreeValue(ctx, *pval);
+    rt->current_stack_frame = sf->prev_frame;
+    return ret_val;
+}
+
 static JSValue *jit_call(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
 {
     JSContext *ctx = f->ctx;
@@ -1262,8 +1388,17 @@ static JSValue *jit_call(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
     }
     argv = sp - argc;
     f->sf->cur_pc = (uint8_t *)op_pc + short_opcode_info(opcode).size;
-    ret = JS_CallInternal(ctx, argv[-1], method ? argv[-2] : JS_UNDEFINED,
-                          JS_UNDEFINED, argc, vc(argv), 0);
+    if (JS_VALUE_GET_TAG(argv[-1]) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(argv[-1])->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+        JS_VALUE_GET_OBJ(argv[-1])->u.func.function_bytecode->jit_state == JIT_STATE_DONE &&
+        JS_VALUE_GET_OBJ(argv[-1])->u.func.function_bytecode->jit->direct &&
+        qjs_jit_direct)
+        ret = jit_call_direct(ctx, JS_VALUE_GET_OBJ(argv[-1]),
+                              method ? argv[-2] : JS_UNDEFINED, JS_UNDEFINED,
+                              argc, argv, false);
+    else
+        ret = JS_CallInternal(ctx, argv[-1], method ? argv[-2] : JS_UNDEFINED,
+                              JS_UNDEFINED, argc, vc(argv), 0);
     if (unlikely(JS_IsException(ret))) {
         f->sp = sp;
         f->pc = op_pc + short_opcode_info(opcode).size;
@@ -1567,7 +1702,31 @@ static JSValue *jit_call_ctor(JSJitFrame *f, JSValue *sp, const uint8_t *op_pc)
     JSValue *argv = sp - argc, ret;
 
     f->sf->cur_pc = (uint8_t *)op_pc + 3;
-    ret = JS_CallConstructorInternal(ctx, argv[-2], argv[-1], argc, vc(argv), 0);
+    if (JS_VALUE_GET_TAG(argv[-2]) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(argv[-2])->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+        JS_VALUE_GET_OBJ(argv[-2])->is_constructor &&
+        !JS_VALUE_GET_OBJ(argv[-2])->u.func.function_bytecode->is_derived_class_constructor &&
+        JS_VALUE_GET_OBJ(argv[-2])->u.func.function_bytecode->jit_state == JIT_STATE_DONE &&
+        JS_VALUE_GET_OBJ(argv[-2])->u.func.function_bytecode->jit->direct &&
+        qjs_jit_direct) {
+        /* JS_CallConstructorInternal()'s legacy constructor, the call
+           direct */
+        JSValue obj = js_create_from_ctor(ctx, argv[-1], JS_CLASS_OBJECT);
+        if (JS_IsException(obj)) {
+            ret = JS_EXCEPTION;
+        } else {
+            ret = jit_call_direct(ctx, JS_VALUE_GET_OBJ(argv[-2]), obj,
+                                  argv[-1], argc, argv, true);
+            if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT || JS_IsException(ret)) {
+                JS_FreeValue(ctx, obj);
+            } else {
+                JS_FreeValue(ctx, ret);
+                ret = obj;
+            }
+        }
+    } else {
+        ret = JS_CallConstructorInternal(ctx, argv[-2], argv[-1], argc, vc(argv), 0);
+    }
     if (unlikely(JS_IsException(ret))) {
         f->sp = sp;
         f->pc = op_pc + 3;
@@ -1634,6 +1793,7 @@ typedef struct {
     uint32_t nics;
     uint32_t exc_exit;          /* code offset of the exception exit */
     uint32_t ret_exit;          /* ... of the return exit (f->ret set) */
+    uint32_t nbail;             /* instructions left to the interpreter */
     bool fail;
 } JitC;
 
@@ -2136,6 +2296,52 @@ static int jc_body(JitC *c)
             t_strd(&c->cb, 2, 3, R_SPV, -16, 0);
             t_strd(&c->cb, 0, 1, R_SPV, -8, 0);
             break;
+        case OP_dup2:                       /* a b -> a b a b */
+            t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
+            jc_dup01(c);
+            jc_push01(c);
+            t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
+            jc_dup01(c);
+            jc_push01(c);
+            break;
+        case OP_insert2:                    /* a b -> b a b */
+            t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);
+            t_ldrd(&c->cb, 2, 3, R_SPV, -16, 0);
+            t_strd(&c->cb, 2, 3, R_SPV, -8, 0);
+            t_strd(&c->cb, 0, 1, R_SPV, -16, 0);
+            jc_dup01(c);
+            jc_push01(c);
+            break;
+        case OP_insert3:                    /* a b c -> c a b c */
+            t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);
+            t_ldrd(&c->cb, 2, 3, R_SPV, -16, 0);
+            t_strd(&c->cb, 2, 3, R_SPV, -8, 0);
+            t_ldrd(&c->cb, 2, 3, R_SPV, -24, 0);
+            t_strd(&c->cb, 2, 3, R_SPV, -16, 0);
+            t_strd(&c->cb, 0, 1, R_SPV, -24, 0);
+            jc_dup01(c);
+            jc_push01(c);
+            break;
+        case OP_push_const8:
+        case OP_push_const:
+            {
+                /* the constant pool's value (it keeps its own reference
+                   while the function lives): its two words, one more
+                   reference when counted */
+                uint32_t idx = op == OP_push_const8 ? a[0] : get_u32(a);
+                uint32_t w[2];
+                if (idx >= (uint32_t)b->cpool_count) {
+                    jc_op(c, pc);
+                    break;
+                }
+                memcpy(w, &b->cpool[idx], sizeof(w));
+                t_movi(&c->cb, 0, w[0]);
+                t_movi(&c->cb, 1, w[1]);
+                if (w[1] >= (uint32_t)-9)
+                    jc_dup01(c);
+                jc_push01(c);
+            }
+            break;
 
         /* int arithmetic inline, the rest in jit_op() */
         case OP_add:
@@ -2414,6 +2620,21 @@ static int jc_body(JitC *c)
                     c->stub[n].back = c->cb.len;
             }
             break;
+        case OP_to_propkey2:
+            {
+                /* an object and an int key: nothing to do; anything else
+                   the slow way (null or undefined throws there) */
+                uint32_t n = jc_stub(c, STUB_OP, 0, pc, 0);
+                t_ldst(&c->cb, LS_LDR, 1, R_SPV, -4);
+                t_cmpi_enc(&c->cb, 1, 0);
+                jc_fix(c, n, 1, CC_NE);
+                t_ldst(&c->cb, LS_LDR, 1, R_SPV, -12);
+                t_cmni_enc(&c->cb, 1, t_modimm(1));     /* cmn r1, #1: object? */
+                jc_fix(c, n, 1, CC_NE);
+                if (!c->fail)
+                    c->stub[n].back = c->cb.len;
+            }
+            break;
         case OP_to_propkey:
             {
                 /* an int already a key; anything else the slow way */
@@ -2633,6 +2854,7 @@ static int jc_body(JitC *c)
             } else {
                 uint32_t n = jc_stub(c, STUB_BAIL, 0, pc, 0);
                 jc_fix(c, n, 1, CC_AL);
+                c->nbail++;
             }
             break;
         }
@@ -2703,6 +2925,23 @@ static void jc_float_arith(JitC *c, int op, uint32_t back)
 }
 
 /* The code: prologue, body, exits, stubs; branches patched */
+/* Whether an exception may be caught in b (try, finally, for-in/of
+   iterators): the interpreter's exception path is needed then */
+static bool jc_has_catch(JSFunctionBytecode *b)
+{
+    uint32_t pc;
+    for (pc = 0; pc < b->byte_code_len;
+         pc += short_opcode_info(b->byte_code_buf[pc]).size) {
+        switch (b->byte_code_buf[pc]) {
+        case OP_catch: case OP_gosub: case OP_ret: case OP_nip_catch:
+        case OP_for_in_start: case OP_for_of_start: case OP_for_await_of_start:
+        case OP_iterator_close:
+            return true;
+        }
+    }
+    return false;
+}
+
 static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
 {
     JitC c;
@@ -2873,6 +3112,7 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     jc->ics = c.ics;
     c.ics = NULL;
     jc->nentries = n;
+    jc->direct = c.nbail == 0 && !jc_has_catch(b);
     for (n = 0, i = 0; i < len; i++) {
         if (c.is_target[i]) {
             jc->entries[n].bc = i;

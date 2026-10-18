@@ -46,6 +46,8 @@ typedef struct JSJitCode {
     uint8_t *code;
     uint32_t size;
     struct JitIC *ics;          /* the property caches */
+    uint8_t direct;             /* never hands back to the interpreter (no
+                                   bail, no catch): jit_call_direct() */
     uint32_t nentries;
     JSJitEntry entries[];
 } JSJitCode;
@@ -55,7 +57,7 @@ typedef int JSJitEnterFunc(JSJitFrame *f, uintptr_t entry);
 static int qjs_jit_stats;               /* QJS_JIT_STATS=1: counts at exit */
 static uint32_t qjs_jit_nop[256];       /* jit_op() calls an opcode */
 static uint32_t qjs_jit_nbail[256];     /* bails at an opcode */
-static uint32_t qjs_jit_nenter, qjs_jit_nfunc;
+static uint32_t qjs_jit_nenter, qjs_jit_nfunc, qjs_jit_ndirect;
 
 struct JSFunctionBytecode;
 static int qjs_jit_compile(JSContext *ctx, struct JSFunctionBytecode *b);
