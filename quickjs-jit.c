@@ -2588,9 +2588,9 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     }
     if (qjs_jit_log) {
         char buf[64];
-        fprintf(stderr, "qjs jit: %s: %d bytes of bytecode, %u of code, %u entries\n",
+        fprintf(stderr, "qjs jit: %s: %d bytes of bytecode, %u of code at %p, %u entries\n",
                 JS_AtomGetStr(ctx, buf, sizeof(buf), b->func_name),
-                b->byte_code_len, jc->size, jc->nentries);
+                b->byte_code_len, jc->size, (void *)jc->code, jc->nentries);
     }
  done:
     free(stub_off);
