@@ -58,7 +58,11 @@
 #else
 #include <sys/ioctl.h>
 #include <poll.h>
-#if !defined(__wasi__)
+#if defined(__NuttX__)
+#include <termios.h>
+#include <sys/wait.h>
+#include "quickjs-nuttx.h"
+#elif !defined(__wasi__)
 #include <dlfcn.h>
 #include <termios.h>
 #include <sys/resource.h>
@@ -3518,6 +3522,7 @@ static char **build_envp(JSContext *ctx, JSValue obj)
     goto done;
 }
 
+#if !defined(__NuttX__)
 /* execvpe is not available on non GNU systems */
 static int my_execvpe(const char *filename, char **argv, char **envp)
 {
@@ -3834,6 +3839,14 @@ static JSValue js_os_exec(JSContext *ctx, JSValueConst this_val,
     ret_val = JS_EXCEPTION;
     goto done;
 }
+
+#else /* __NuttX__: no fork(); exec() refused */
+static JSValue js_os_exec(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv)
+{
+    return JS_ThrowTypeError(ctx, "exec is not supported on this system");
+}
+#endif /* __NuttX__ */
 
 /* getpid() -> pid */
 static JSValue js_os_getpid(JSContext *ctx, JSValueConst this_val,

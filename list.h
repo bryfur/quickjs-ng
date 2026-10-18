@@ -24,6 +24,14 @@
 #ifndef LIST_H
 #define LIST_H
 
+#if defined(__NuttX__)
+/* NuttX's own list (nuttx/list.h, which system headers such as aio.h
+   include) has macros of the same names: it comes first, then they go */
+#include <nuttx/list.h>
+#undef list_entry
+#undef list_add_tail
+#endif
+
 #ifndef NULL
 #include <stddef.h>
 #endif

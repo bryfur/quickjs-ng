@@ -36,6 +36,13 @@
 #include "quickjs.h"
 #include "quickjs-libc.h"
 
+#if defined(__NuttX__)
+/* NuttX's unistd.h makes these names macros (per-task getopt state);
+   qjs parses its options itself, in locals of the same names */
+#undef optind
+#undef optarg
+#endif
+
 #ifdef QJS_USE_MIMALLOC
 #include <mimalloc.h>
 #endif
@@ -227,6 +234,11 @@ static const JSCFunctionListEntry global_obj[] = {
 };
 
 /* also used to initialize the worker context */
+#ifdef QJS_INIT_EXTRA
+/* The embedder's own modules (QJS_INIT_EXTRA=name: void name(JSContext *)) */
+void QJS_INIT_EXTRA(JSContext *ctx);
+#endif
+
 static JSContext *JS_NewCustomContext(JSRuntime *rt)
 {
     JSContext *ctx;
@@ -237,6 +249,9 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     js_init_module_std(ctx, "qjs:std");
     js_init_module_os(ctx, "qjs:os");
     js_init_module_bjson(ctx, "qjs:bjson");
+#ifdef QJS_INIT_EXTRA
+    QJS_INIT_EXTRA(ctx);
+#endif
 
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyFunctionList(ctx, global, global_obj, countof(global_obj));
@@ -622,6 +637,11 @@ start:
     }
     if (memory_limit >= 0)
         JS_SetMemoryLimit(rt, (size_t)memory_limit);
+#ifdef QJS_DEFAULT_STACK_SIZE
+    /* A small machine: the C stack the interpreter may use by default */
+    if (stack_size < 0)
+        stack_size = QJS_DEFAULT_STACK_SIZE;
+#endif
     if (stack_size >= 0)
         JS_SetMaxStackSize(rt, (size_t)stack_size);
     if (dump_flags != 0)
