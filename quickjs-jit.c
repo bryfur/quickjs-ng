@@ -2414,6 +2414,67 @@ static int jc_body(JitC *c)
     return c->fail || c->cb.oom ? -1 : 0;
 }
 
+/* add, sub, mul of two floats in a slow path (its int path failed): the
+   double operation called (the firmware's: the RP2350's DCP), NaN boxing
+   undone and done again; back to `back`.  Anything else falls through to
+   the C that follows. */
+extern double __aeabi_dadd(double, double);
+extern double __aeabi_dsub(double, double);
+extern double __aeabi_dmul(double, double);
+
+#define JIT_F64_ADDEND ((uint32_t)JS_FLOAT64_TAG_ADDEND)
+
+static void jc_float_arith(JitC *c, int op, uint32_t back)
+{
+    uint32_t p1, p2, p3;
+
+    t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
+    t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);
+    /* a float's tag: (unsigned)(tag + 9) >= 17 */
+    t_dp_imm(&c->cb, DP_ADD, 0, R_IP, 1, t_modimm(9));
+    t_cmpi_enc(&c->cb, R_IP, 17);
+    p1 = c->cb.len;
+    e32(&c->cb, 0, 0);                              /* blo.w not floats */
+    t_dp_imm(&c->cb, DP_ADD, 0, R_IP, 3, t_modimm(9));
+    t_cmpi_enc(&c->cb, R_IP, 17);
+    p2 = c->cb.len;
+    e32(&c->cb, 0, 0);                              /* blo.w not floats */
+    t_movi(&c->cb, R_IP, JIT_F64_ADDEND);
+    t_dp_reg(&c->cb, DP_ADD, 0, 1, 1, R_IP, SH_LSL, 0);
+    t_dp_reg(&c->cb, DP_ADD, 0, 3, 3, R_IP, SH_LSL, 0);
+    jc_call(c, op == OP_add ? (void *)__aeabi_dadd :
+               op == OP_sub ? (void *)__aeabi_dsub : (void *)__aeabi_dmul);
+    /* a NaN: the one JS_NAN; else boxed again */
+    t_dp_imm(&c->cb, DP_BIC, 0, R_IP, 1, t_modimm(0x80000000));  /* ip = hi & 0x7fffffff */
+    t_movi(&c->cb, R_LR, 0x7ff00000);
+    t_cmp(&c->cb, R_IP, R_LR);
+    p3 = c->cb.len;
+    e32(&c->cb, 0, 0);                              /* bhi.w NaN */
+    {
+        uint32_t p4, p5, p6;
+        p4 = c->cb.len;
+        e32(&c->cb, 0, 0);                          /* bne.w boxed (a number) */
+        t_cmpi_enc(&c->cb, 0, 0);                   /* 0x7ff00000: inf if lo 0 */
+        p5 = c->cb.len;
+        e32(&c->cb, 0, 0);                          /* bne.w NaN */
+        t_bcc_at(&c->cb, p4, CC_NE, (int32_t)(c->cb.len - p4));
+        t_movi(&c->cb, R_IP, JIT_F64_ADDEND);
+        t_dp_reg(&c->cb, DP_SUB, 0, 1, 1, R_IP, SH_LSL, 0);
+        p6 = c->cb.len;
+        e32(&c->cb, 0, 0);                          /* b.w store */
+        t_bcc_at(&c->cb, p3, CC_HI, (int32_t)(c->cb.len - p3));
+        t_bcc_at(&c->cb, p5, CC_NE, (int32_t)(c->cb.len - p5));
+        t_movi(&c->cb, 0, (uint32_t)JS_NAN);
+        t_movi(&c->cb, 1, (uint32_t)(JS_NAN >> 32));
+        t_b_at(&c->cb, p6, (int32_t)(c->cb.len - p6), false);
+    }
+    t_strd(&c->cb, 0, 1, R_SPV, -16, 0);
+    t_addi(&c->cb, R_SPV, R_SPV, -8);
+    jc_fix(c, back, 2, CC_AL);
+    t_bcc_at(&c->cb, p1, CC_LO, (int32_t)(c->cb.len - p1));
+    t_bcc_at(&c->cb, p2, CC_LO, (int32_t)(c->cb.len - p2));
+}
+
 /* The code: prologue, body, exits, stubs; branches patched */
 static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -2484,6 +2545,11 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
         st = c.stub[i];         /* (a copy: emitting may grow c.stub) */
         switch (s->kind) {
         case STUB_OP:
+            {
+                int sop = b->byte_code_buf[s->pc];
+                if (sop == OP_add || sop == OP_sub || sop == OP_mul)
+                    jc_float_arith(&c, sop, s->back);
+            }
             jc_op(&c, s->pc);
             if (s->back == 0xffffffff)
                 jc_fix(&c, s->target, 0, CC_AL);    /* to the jump's code */
