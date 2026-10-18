@@ -245,6 +245,12 @@ void QJS_NAME_PROGRAM(const char *script);
 JSModuleDef *QJS_MODULE_LOADER(JSContext *ctx, const char *module_name,
                                void *opaque, JSValueConst attributes);
 #endif
+#ifdef QJS_MAIN_HOOK
+/* The embedder may run main() somewhere else first, e.g. on a bigger stack
+ * (QJS_MAIN_HOOK=name: int name(int argc, char **argv, int *ret), 1 with
+ * *ret set when it did, 0 to go on here) */
+int QJS_MAIN_HOOK(int argc, char **argv, int *ret);
+#endif
 
 static JSContext *JS_NewCustomContext(JSRuntime *rt)
 {
@@ -454,6 +460,11 @@ int main(int argc, char **argv)
     int i, include_count = 0;
     int64_t memory_limit = -1;
     int64_t stack_size = -1;
+
+#ifdef QJS_MAIN_HOOK
+    if (QJS_MAIN_HOOK(argc, argv, &r))
+        return r;
+#endif
 
     /* save for later */
     qjs__argc = argc;
