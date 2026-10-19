@@ -40789,6 +40789,9 @@ static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
         val = JS_NewObjectProtoList(ctx, proto,
                                     e->u.prop_list.tab, e->u.prop_list.len);
         break;
+    case JS_DEF_LAZY:
+        val = e->u.lazy.init(ctx, e);
+        break;
     default:
         abort();
     }
@@ -40884,6 +40887,7 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
         break;
     case JS_DEF_PROP_STRING:
     case JS_DEF_OBJECT:
+    case JS_DEF_LAZY:
         JS_DefineAutoInitProperty(ctx, obj, atom, JS_AUTOINIT_ID_PROP,
                                   (void *)e, prop_flags);
         return 0;

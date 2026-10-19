@@ -1390,6 +1390,12 @@ typedef struct JSCFunctionListEntry {
             const struct JSCFunctionListEntry *tab;
             int len;
         } prop_list;
+        struct {
+            /* JS_DEF_LAZY: the value, made on first use in the realm the
+               property was defined in */
+            JSValue (*init)(JSContext *ctx, const struct JSCFunctionListEntry *e);
+            const void *opaque;
+        } lazy;
         const char *str;    /* pure ASCII or UTF-8 encoded */
         int32_t i32;
         int64_t i64;
@@ -1410,6 +1416,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_DEF_ALIAS          9
 #define JS_DEF_PROP_SYMBOL   10
 #define JS_DEF_PROP_BOOL     11
+#define JS_DEF_LAZY          12
 
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
@@ -1430,6 +1437,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_PROP_SYMBOL_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_SYMBOL, 0, { .i32 = val } }
 #define JS_PROP_BOOL_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_BOOL, 0, { .i32 = val } }
 #define JS_OBJECT_DEF(name, tab, len, prop_flags) { name, prop_flags, JS_DEF_OBJECT, 0, { .prop_list = { tab, len } } }
+#define JS_LAZY_DEF(name, init1, opaque1, prop_flags) { name, prop_flags, JS_DEF_LAZY, 0, { .lazy = { init1, opaque1 } } }
 #define JS_ALIAS_DEF(name, from) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_ALIAS, 0, { .alias = { from, -1 } } }
 #define JS_ALIAS_BASE_DEF(name, from, base) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_ALIAS, 0, { .alias = { from, base } } }
 
