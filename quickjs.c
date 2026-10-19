@@ -9101,6 +9101,37 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
         return -1;
 
     realm = js_autoinit_get_realm(pr);
+    if (js_autoinit_get_id(pr) == JS_AUTOINIT_ID_PROP &&
+        ((const JSCFunctionListEntry *)pr->u.init.opaque)->def_type ==
+        JS_DEF_CGETSET_LAZY) {
+        /* an accessor: its getter and setter made now */
+        const JSCFunctionListEntry *e = pr->u.init.opaque;
+        JSValue getter = JS_UNDEFINED, setter = JS_UNDEFINED;
+        char buf[64];
+
+        if (e->u.getset.get.generic) {
+            snprintf(buf, sizeof(buf), "get %s", e->name);
+            getter = JS_NewCFunction2(realm, e->u.getset.get.generic, buf, 0,
+                                      JS_CFUNC_getter, 0);
+            if (JS_IsException(getter))
+                return -1;
+        }
+        if (e->u.getset.set.generic) {
+            snprintf(buf, sizeof(buf), "set %s", e->name);
+            setter = JS_NewCFunction2(realm, e->u.getset.set.generic, buf, 1,
+                                      JS_CFUNC_setter, 0);
+            if (JS_IsException(setter)) {
+                JS_FreeValue(ctx, getter);
+                return -1;
+            }
+        }
+        js_autoinit_free(ctx->rt, pr);
+        prs->flags = (prs->flags & ~(JS_PROP_TMASK | JS_PROP_WRITABLE)) |
+                     JS_PROP_GETSET;
+        pr->u.getset.getter = JS_IsUndefined(getter) ? NULL : JS_VALUE_GET_OBJ(getter);
+        pr->u.getset.setter = JS_IsUndefined(setter) ? NULL : JS_VALUE_GET_OBJ(setter);
+        return 0;
+    }
     func = js_autoinit_func_table[js_autoinit_get_id(pr)];
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
@@ -40893,6 +40924,7 @@ static int JS_InstantiateFunctionListItem(JSContext *ctx, JSValueConst obj,
     case JS_DEF_PROP_STRING:
     case JS_DEF_OBJECT:
     case JS_DEF_LAZY:
+    case JS_DEF_CGETSET_LAZY:
         JS_DefineAutoInitProperty(ctx, obj, atom, JS_AUTOINIT_ID_PROP,
                                   (void *)e, prop_flags);
         return 0;

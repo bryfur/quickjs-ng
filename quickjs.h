@@ -1419,6 +1419,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_DEF_PROP_SYMBOL   10
 #define JS_DEF_PROP_BOOL     11
 #define JS_DEF_LAZY          12
+#define JS_DEF_CGETSET_LAZY  13
 
 /* Note: c++ does not like nested designators */
 #define JS_CFUNC_DEF(name, length, func1) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_CFUNC, 0, { .func = { length, JS_CFUNC_generic, { .generic = func1 } } } }
@@ -1439,6 +1440,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_PROP_SYMBOL_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_SYMBOL, 0, { .i32 = val } }
 #define JS_PROP_BOOL_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_BOOL, 0, { .i32 = val } }
 #define JS_OBJECT_DEF(name, tab, len, prop_flags) { name, prop_flags, JS_DEF_OBJECT, 0, { .prop_list = { tab, len } } }
+#define JS_CGETSET_LAZY_DEF(name, fgetter, fsetter, prop_flags) { name, prop_flags, JS_DEF_CGETSET_LAZY, 0, { .getset = { .get = { .getter = fgetter }, .set = { .setter = fsetter } } } }
 #define JS_LAZY_DEF(name, init1, opaque1, prop_flags) { name, prop_flags, JS_DEF_LAZY, 0, { .lazy = { init1, opaque1 } } }
 #define JS_ALIAS_DEF(name, from) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_ALIAS, 0, { .alias = { from, -1 } } }
 #define JS_ALIAS_BASE_DEF(name, from, base) { name, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, JS_DEF_ALIAS, 0, { .alias = { from, base } } }
