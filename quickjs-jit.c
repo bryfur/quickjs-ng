@@ -37,6 +37,7 @@
 
 
 static int qjs_jit_threshold = -1;      /* -1: not read yet; 0: off */
+static int qjs_jit_size = 256;         /* QJS_JIT_SIZE: bytecode bytes a threshold more (0: off) */
 static int qjs_jit_log;
 static int qjs_jit_direct = 1;      /* QJS_JIT_DIRECT=0: off */
 #if defined(__NuttX__)
@@ -97,6 +98,9 @@ static void qjs_jit_config(void)
     s = getenv("QJS_JIT_PSRAM");
     qjs_jit_psram = s && *s == '1';
 #endif
+    s = getenv("QJS_JIT_SIZE");
+    if (s)
+        qjs_jit_size = atoi(s);
     s = getenv("QJS_JIT_DIRECT");
     qjs_jit_direct = !s || *s != '0';
     s = getenv("QJS_JIT_STATS");
@@ -3177,15 +3181,25 @@ static int qjs_jit_compile(JSContext *ctx, JSFunctionBytecode *b)
 }
 
 /* Whether b should be compiled now: counted at each call (calls) or
-   backward jump */
+   backward jump.  A bigger function must be hotter: one more threshold for
+   each qjs_jit_size bytes of bytecode.  Its code is 10-40 times the
+   bytecode and goes only where it runs fast (the SRAM, a few hundred KB
+   shared with everything else): compiled at the same count, Crypto's
+   run-once setup (its top level, 6 KB of bytecode, 95 KB of code) took the
+   room its hot loops needed, which then stayed interpreted. */
 static bool qjs_jit_want(JSFunctionBytecode *b, int weight)
 {
+    uint32_t need;
+
     if (unlikely(qjs_jit_threshold < 0))
         qjs_jit_config();
     if (qjs_jit_threshold == 0)
         return false;
     b->jit_hits += weight;
-    return b->jit_hits >= (uint32_t)qjs_jit_threshold * 16;
+    need = (uint32_t)qjs_jit_threshold * 16;
+    if (qjs_jit_size > 0)
+        need *= 1 + (uint32_t)b->byte_code_len / (uint32_t)qjs_jit_size;
+    return b->jit_hits >= need;
 }
 
 /* The compiled code's entry for bytecode at pc, or 0 */
