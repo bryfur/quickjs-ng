@@ -3925,6 +3925,11 @@ static bool JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
     }
 }
 
+bool JS_AtomToArrayIndex(JSContext *ctx, JSAtom atom, uint32_t *pidx)
+{
+    return JS_AtomIsArrayIndex(ctx, pidx, atom);
+}
+
 /* This test must be fast if atom is not a numeric index (e.g. a
    method name). Return JS_UNDEFINED if not a numeric
    index. JS_EXCEPTION can also be returned. */
