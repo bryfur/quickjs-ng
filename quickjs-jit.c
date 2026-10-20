@@ -58,6 +58,13 @@ static const char *const jit_op_names[] = {
    not an object or not an int index, not a fast array, past its end,
    one past its end (an append) */
 static uint32_t jit_el_miss[2][4];
+/* QJS_JIT_STATS: code bytes made for each opcode (inline) and each kind of
+   cold stub, and how many of each */
+static uint32_t jit_code_op[256], jit_code_nop[256];
+static uint32_t jit_code_stub[8], jit_code_nstub[8];
+static const char *const jit_stub_names[8] = {
+    "op", "free", "bail", "bool", "poll", "getf", "thunks", "?"
+};
 static void jit_el_why(JSValueConst o, JSValueConst i, int put)
 {
     if (JS_VALUE_GET_TAG(o) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(i) != JS_TAG_INT)
@@ -80,6 +87,23 @@ static void qjs_jit_print_stats(void)
                 jit_el_miss[i][2], jit_el_miss[i][3]);
     fprintf(stderr, "qjs jit: %u functions compiled, %u entries, %u direct calls\n",
             qjs_jit_nfunc, qjs_jit_nenter, qjs_jit_ndirect);
+    {
+        uint32_t tot = 0, j;
+        for (j = 0; j < 256; j++)
+            tot += jit_code_op[j];
+        for (j = 0; j < 8; j++)
+            tot += jit_code_stub[j];
+        fprintf(stderr, "qjs jit: code made: %u bytes\n", tot);
+        for (j = 0; j < 8; j++)
+            if (jit_code_nstub[j])
+                fprintf(stderr, "qjs jit: code stub %-8s %7u bytes, %6u stubs\n",
+                        jit_stub_names[j], jit_code_stub[j], jit_code_nstub[j]);
+        for (j = 0; j < 256; j++)
+            if (jit_code_op[j])
+                fprintf(stderr, "qjs jit: code op %-22s %7u bytes, %6u sites\n",
+                        j < OP_COUNT ? jit_op_names[j] : "?",
+                        jit_code_op[j], jit_code_nop[j]);
+    }
     for (i = 0; i < 256; i++) {
         if (qjs_jit_nop[i] || qjs_jit_nbail[i])
             fprintf(stderr, "qjs jit: %-22s jit_op %9u  bail %9u\n",
@@ -137,6 +161,10 @@ static void jit_code_free(void *p, size_t size)
     up_textheap_free(p);
 }
 
+#define JIT_LOCK()
+#define JIT_UNLOCK()
+#define jit_code_alloc_locked jit_code_alloc
+
 static void jit_code_sync(void *p, size_t size)
 {
     (void)p; (void)size;
@@ -145,16 +173,53 @@ static void jit_code_sync(void *p, size_t size)
 #else
 #include <sys/mman.h>
 
+/* One region for all the code (15 MB: a BL reaches across it, so every
+   function reaches the shared routines' pool, as on the board where all
+   of it is in the SRAM); what is freed is not reused (the tests' runs are
+   short) */
+#define JIT_REGION (15 << 20)
+#include <pthread.h>
+static uint8_t *jit_region;
+static size_t jit_region_used;
+/* Runtimes in several threads (run-test262 -t) share the region and the
+   pool: a lock around both.  On the board each process has its own copy of
+   the module's data and runs JavaScript in one thread (qjs, NetSurf's
+   pages, Photon's apps); a mutex there would be in the PSRAM, where
+   exclusive access hangs. */
+static pthread_mutex_t jit_lock_m = PTHREAD_MUTEX_INITIALIZER;
+#define JIT_LOCK()   pthread_mutex_lock(&jit_lock_m)
+#define JIT_UNLOCK() pthread_mutex_unlock(&jit_lock_m)
+
+static void *jit_code_alloc_locked(size_t size)
+{
+    void *p;
+    if (!jit_region) {
+        p = mmap(NULL, JIT_REGION, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return NULL;
+        jit_region = p;
+    }
+    size = (size + 7) & ~(size_t)7;
+    if (jit_region_used + size > JIT_REGION)
+        return NULL;
+    p = jit_region + jit_region_used;
+    jit_region_used += size;
+    return p;
+}
+
 static void *jit_code_alloc(size_t size)
 {
-    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
+    void *p;
+    JIT_LOCK();
+    p = jit_code_alloc_locked(size);
+    JIT_UNLOCK();
+    return p;
 }
 
 static void jit_code_free(void *p, size_t size)
 {
-    munmap(p, size);
+    (void)p; (void)size;
 }
 
 static void jit_code_sync(void *p, size_t size)
@@ -1459,6 +1524,9 @@ typedef struct JitIC {
     JSShape *hshape2;
     uint32_t hidx2;
     uint8_t next;               /* the entry to replace next */
+    /* the site, for the function's shared routines (get_field's) */
+    JSAtom atom;
+    const uint8_t *pc;
 } JitIC;
 
 static inline __attribute__((always_inline)) JSProperty *ic_slot(JSObject *p, uint32_t i, JSAtom atom,
@@ -1814,7 +1882,40 @@ typedef struct {
     uint32_t ret_exit;          /* ... of the return exit (f->ret set) */
     uint32_t nbail;             /* instructions left to the interpreter */
     bool fail;
+    /* the function's shared routines (thunks, after its stubs), reached
+       by BL: what many sites would otherwise each carry */
+    struct {
+        uint8_t kind;
+        uint8_t arg;            /* TK_CALL: literal words; TK_FLOAT: op;
+                                   TK_GETF: consumes the object */
+        void *fn;
+        uint32_t off;
+    } thunk[24];
+    uint32_t nthunk;
+    bool pool;                  /* thunk[] is the pool's (fix kind 5) */
 } JitC;
+
+/* The process's pool of shared routines (BL from any function in reach:
+   all compiled code in the SRAM, or under Linux in one region), the
+   exception exit at its start; else (code allowed in the PSRAM) each
+   function has its own after its stubs */
+#define JIT_POOL 2048
+static uint8_t *jit_pool;               /* its executable copy */
+static jbuf_t jit_pool_img;             /* what is in it */
+static struct {
+    uint8_t kind, arg;
+    void *fn;
+    uint32_t off;
+} jit_pool_thunk[24];
+static uint32_t jit_pool_nthunk;
+
+enum {
+    TK_CALL,        /* fn(f, sp, literal word(s) after the BL): sp, NULL an exception */
+    TK_FLOAT,       /* add/sub/mul of two floats inline, else TK_CALL jit_arith */
+    TK_FREE,        /* jit_free_value(ctx, r2:r3) */
+    TK_GETF,        /* the prototype slot of the cache in ip, else jit_get_field() */
+    TK_EQ,          /* ==, ===, ... of what is not two ints (arg: loose) */
+};
 
 static void jc_fix(JitC *c, uint32_t target, int kind, int cond)
 {
@@ -1901,6 +2002,44 @@ static void jc_call(JitC *c, void *fn)
     t_blx(&c->cb, R_IP);
 }
 
+/* The function's shared routine of a kind (made once, emitted after the
+   stubs): its index */
+static uint32_t jit_pool_thunk_get(int kind, int arg, void *fn);
+
+static uint32_t jc_thunk(JitC *c, int kind, int arg, void *fn)
+{
+    uint32_t i;
+    if (c->pool) {
+        i = jit_pool_thunk_get(kind, arg, fn);
+        if (i == (uint32_t)-1)
+            c->fail = true;
+        return i;
+    }
+    for (i = 0; i < c->nthunk; i++)
+        if (c->thunk[i].kind == kind && c->thunk[i].arg == arg && c->thunk[i].fn == fn)
+            return i;
+    if (c->nthunk == countof(c->thunk)) {
+        c->fail = true;
+        return 0;
+    }
+    c->thunk[c->nthunk].kind = kind;
+    c->thunk[c->nthunk].arg = arg;
+    c->thunk[c->nthunk].fn = fn;
+    return c->nthunk++;
+}
+
+/* BL to a shared routine */
+static void jc_bl(JitC *c, uint32_t t)
+{
+    jc_fix(c, t, c->pool ? 5 : 3, CC_AL);
+}
+
+/* a literal word in the code (after a BL: the routine's argument) */
+static void jc_word(JitC *c, uint32_t v)
+{
+    e32(&c->cb, v & 0xffff, v >> 16);
+}
+
 /* The reference count of a value's object: in the allocator's block
    header, before the object (js_rc()) */
 #define JIT_RC_OFF ((int)offsetof(JSMallocBlockHeader, ref_count) - \
@@ -1919,12 +2058,14 @@ static void jc_dup01(JitC *c)
 /* r2:r3 (a value) referenced once less (freed at 0) */
 static void jc_free23(JitC *c)
 {
+    uint32_t t = jc_thunk(c, TK_FREE, 0, NULL);
     t_cmni_enc(&c->cb, 3, t_modimm(9));             /* cmn r3, #9 */
-    e16(&c->cb, 0xd307);                            /* bcc: over the next 16 bytes */
+    e16(&c->cb, 0xd308);                            /* bcc: over the next 18 bytes */
     t_ldst(&c->cb, LS_LDR, R_IP, 2, JIT_RC_OFF);    /* ldr.w ip, [r2, #rc] */
     t_dp_imm(&c->cb, DP_SUB, 1, R_IP, R_IP, t_modimm(1)); /* subs ip, #1 */
     t_ldst(&c->cb, LS_STR, R_IP, 2, JIT_RC_OFF);    /* str.w ip, [r2, #rc] */
-    jc_cold(c, CC_LE, STUB_FREE, 0);
+    t_it(&c->cb, CC_LE, "t");
+    jc_bl(c, t);                                    /* blle: freed at 0 */
 }
 
 static void jc_push01(JitC *c)
@@ -1987,37 +2128,26 @@ static void jc_vref(JitC *c, int idx)
 /* the instruction at bytecode offset pc run by jit_op() */
 static void jc_op(JitC *c, uint32_t pc)
 {
-    t_mov(&c->cb, 0, R_F);
-    t_mov(&c->cb, 1, R_SPV);
-    t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
-    jc_call(c, jit_is_arith(c->b->byte_code_buf[pc]) ? (void *)jit_arith :
-                                                        (void *)jit_op);
-    e16(&c->cb, 0x0004);                            /* movs r4, r0 */
-    jc_fix(c, c->exc_exit, 2, CC_EQ);
+    void *fn = jit_is_arith(c->b->byte_code_buf[pc]) ? (void *)jit_arith :
+                                                        (void *)jit_op;
+    jc_bl(c, jc_thunk(c, TK_CALL, 1, fn));
+    jc_word(c, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
 }
 
 /* the instruction at pc run by fn(f, sp, pc) */
 static void jc_op_fn(JitC *c, uint32_t pc, void *fn)
 {
-    t_mov(&c->cb, 0, R_F);
-    t_mov(&c->cb, 1, R_SPV);
-    t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
-    jc_call(c, fn);
-    e16(&c->cb, 0x0004);                            /* movs r4, r0 */
-    jc_fix(c, c->exc_exit, 2, CC_EQ);
+    jc_bl(c, jc_thunk(c, TK_CALL, 1, fn));
+    jc_word(c, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
 }
 
 /* the instruction at pc run by fn(f, sp, pc, its property cache) */
 static void jc_op_ic(JitC *c, uint32_t pc, void *fn)
 {
     struct JitIC *ic = &c->ics[c->nics++];
-    t_mov(&c->cb, 0, R_F);
-    t_mov(&c->cb, 1, R_SPV);
-    t_movi(&c->cb, 2, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
-    t_movi(&c->cb, 3, (uint32_t)(uintptr_t)ic);
-    jc_call(c, fn);
-    e16(&c->cb, 0x0004);                            /* movs r4, r0 */
-    jc_fix(c, c->exc_exit, 2, CC_EQ);
+    jc_bl(c, jc_thunk(c, TK_CALL, 2, fn));
+    jc_word(c, (uint32_t)(uintptr_t)(c->b->byte_code_buf + pc));
+    jc_word(c, (uint32_t)(uintptr_t)ic);
 }
 
 /* get_field, get_field2 inline when the cache's own slot is right (the
@@ -2030,6 +2160,8 @@ static void jc_get_field_inline(JitC *c, uint32_t pc, int op)
                   get_u32(c->b->byte_code_buf + pc + 1);
     uint32_t n = jc_stub(c, STUB_GETF, 0, pc, (uint32_t)(uintptr_t)ic);
 
+    ic->atom = atom;
+    ic->pc = c->b->byte_code_buf + pc;
     t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);                 /* the object */
     t_cmni_enc(&c->cb, 1, t_modimm(1));
     jc_fix(c, n, 1, CC_NE);
@@ -2071,25 +2203,24 @@ static void jc_get_field_inline(JitC *c, uint32_t pc, int op)
         c->stub[n].back = c->cb.len;
 }
 
-/* In get_field's stub, before jit_get_field(): the cache's prototype slot
-   checked inline (the receiver's shape, hashed, its hash and prototype as
-   cached, the prototype's shape as cached, the slot's atom and flags); a
-   hit gives the value and goes back.  A miss falls through to the C. */
-static void jc_getf_proto(JitC *c, int op, uint32_t pc, struct JitIC *ic,
-                          uint32_t back)
+/* TK_GETF, get_field's stubs' shared routine (BL, the cache in ip): the
+   cache's prototype slot checked (the receiver's shape, hashed, its hash
+   and prototype as cached, the prototype's shape as cached, the slot's
+   atom and flags); a hit gives the value, else jit_get_field() (which
+   also updates the cache).  consume: get_field and get_length (the object
+   replaced by the value) rather than get_field2 (the value pushed). */
+static void jc_thunk_getf(JitC *c, bool consume)
 {
     uint32_t miss[10];
     int cond[10];
     int nm = 0, i;
-    JSAtom atom = op == OP_get_length ? JS_ATOM_length :
-                  get_u32(c->b->byte_code_buf + pc + 1);
 
 #define JMISS(cc) do { miss[nm] = c->cb.len; cond[nm++] = (cc); \
                        e32(&c->cb, 0, 0); } while (0)
+    t_push(&c->cb, 1 << R_IP | 1 << R_LR);              /* the cache, lr */
     t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);
     t_cmni_enc(&c->cb, 1, t_modimm(1));
     JMISS(CC_NE);                                       /* not an object */
-    t_movi(&c->cb, R_IP, (uint32_t)(uintptr_t)ic);
     t_ldst(&c->cb, LS_LDR, 2, 0, offsetof(JSObject, shape));
     t_ldst(&c->cb, LS_LDR, 3, R_IP, offsetof(struct JitIC, rshape));
     t_cmp(&c->cb, 2, 3);
@@ -2110,6 +2241,7 @@ static void jc_getf_proto(JitC *c, int op, uint32_t pc, struct JitIC *ic,
     t_cmp(&c->cb, 2, R_LR);
     JMISS(CC_NE);
     /* r3 the holder, r2 its shape: the slot (hidx) checked as an own one */
+    t_ldst(&c->cb, LS_LDR, 1, R_IP, offsetof(struct JitIC, atom));
     t_ldst(&c->cb, LS_LDR, R_IP, R_IP, offsetof(struct JitIC, hidx));
     t_ldst(&c->cb, LS_LDR, R_LR, 2, offsetof(JSShape, prop_count));
     t_cmp(&c->cb, R_IP, R_LR);
@@ -2119,13 +2251,13 @@ static void jc_getf_proto(JitC *c, int op, uint32_t pc, struct JitIC *ic,
     t_addi(&c->cb, R_LR, R_LR, offsetof(JSShape, hash_table) + 4);
     t_dp_reg(&c->cb, DP_ADD, 0, R_LR, R_LR, R_IP, SH_LSL, 3);
     t_ldst(&c->cb, LS_LDR, 2, R_LR, offsetof(JSShapeProperty, atom));
-    t_movi(&c->cb, 1, atom);
-    t_cmp(&c->cb, 2, 1);
+    t_cmp(&c->cb, 2, 1);                                /* the cache's atom */
     JMISS(CC_NE);
     t_ldst(&c->cb, LS_LDR, 2, R_LR, 0);                 /* hash_next:26, flags:6 */
     t_dp_imm(&c->cb, DP_AND, 1, 2, 2, t_modimm((uint32_t)JS_PROP_TMASK << 26));
     JMISS(CC_NE);
-    if (op != OP_get_field2) {
+    t_ldrd(&c->cb, 0, 1, R_SPV, -8, 0);                 /* the object again */
+    if (consume) {
         t_ldst(&c->cb, LS_LDR, 2, 0, JIT_RC_OFF);       /* the object's count */
         t_cmpi_enc(&c->cb, 2, 1);
         JMISS(CC_LE);
@@ -2136,14 +2268,251 @@ static void jc_getf_proto(JitC *c, int op, uint32_t pc, struct JitIC *ic,
     t_dp_reg(&c->cb, DP_ADD, 0, R_LR, R_LR, R_IP, SH_LSL, 3);
     t_ldrd(&c->cb, 0, 1, R_LR, 0, 0);
     jc_dup01(c);
-    if (op != OP_get_field2)
+    if (consume)
         t_strd(&c->cb, 0, 1, R_SPV, -8, 0);
     else
         jc_push01(c);
-    jc_fix(c, back, 2, CC_AL);
+    t_pop(&c->cb, 1 << R_IP | 1 << 15);                 /* back to the stub */
     for (i = 0; i < nm; i++)
         t_bcc_at(&c->cb, miss[i], cond[i], (int32_t)(c->cb.len - miss[i]));
 #undef JMISS
+    /* jit_get_field(f, sp, the cache's pc, the cache) */
+    t_ldst(&c->cb, LS_LDR, 3, R_SP, 0);
+    t_ldst(&c->cb, LS_LDR, 2, 3, offsetof(struct JitIC, pc));
+    t_mov(&c->cb, 0, R_F);
+    t_mov(&c->cb, 1, R_SPV);
+    jc_call(c, (void *)jit_get_field);
+    e16(&c->cb, 0x0004);                                /* movs r4, r0 */
+    t_pop(&c->cb, 1 << R_IP | 1 << R_LR);
+    jc_fix(c, c->exc_exit, 2, CC_EQ);
+    t_bx(&c->cb, R_LR);
+}
+
+/* TK_EQ: ==, != (loose) or ===, !== of two values that are not both
+   ints (r0:r1, r2:r3; the site has tried that), the shared routine (BL):
+   both objects (the same one?), bools, nulls or undefineds, or null or
+   undefined against another: back with the payloads to compare in r0 and
+   r2 and r1 = 0; else r1 = 1, nothing changed (the site takes its stub,
+   the C) */
+static void jc_thunk_eq(JitC *c, bool loose)
+{
+    uint32_t slow[8];
+    int slowcc[8], nslow = 0, i;
+    uint32_t p2, p3, pd, pn1, pt1, pt2, pt3;
+
+#define JSLOW(cc) do { slow[nslow] = c->cb.len; slowcc[nslow++] = (cc); \
+                       e32(&c->cb, 0, 0); } while (0)
+    t_push(&c->cb, 1 << 3 | 1 << R_LR);
+    t_cmp(&c->cb, 1, 3);
+    pd = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* bne.w: tags differ */
+    t_dp_imm(&c->cb, DP_ADD, 1, R_IP, 1, t_modimm(1)); /* adds ip, r1, #1 */
+    p2 = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* bne.w: not objects */
+    /* two objects: the comparison drops a reference to
+       each; inline only when neither goes (a count above 2) */
+    t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
+    t_cmpi_enc(&c->cb, R_IP, 2);
+    JSLOW(CC_LE);
+    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF);
+    t_cmpi_enc(&c->cb, R_LR, 2);
+    JSLOW(CC_LE);
+    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
+    t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
+    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF); /* (the same one?) */
+    t_dp_imm(&c->cb, DP_SUB, 0, R_LR, R_LR, t_modimm(1));
+    t_ldst(&c->cb, LS_STR, R_LR, 2, JIT_RC_OFF);
+    p3 = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* b.w: compare */
+    t_bcc_at(&c->cb, p2, CC_NE, (int32_t)(c->cb.len - p2));
+    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 1, t_modimm(1)); /* sub ip, r1, #1 */
+    t_cmpi_enc(&c->cb, R_IP, 2);        /* bool, null, undefined */
+    JSLOW(CC_HI);
+    pt1 = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* b.w: compare */
+    /* tags differ: null or undefined against another */
+    t_bcc_at(&c->cb, pd, CC_NE, (int32_t)(c->cb.len - pd));
+    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 1, t_modimm(JS_TAG_NULL));
+    t_cmpi_enc(&c->cb, R_IP, 1);
+    pn1 = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* bls.w: the first is */
+    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 3, t_modimm(JS_TAG_NULL));
+    t_cmpi_enc(&c->cb, R_IP, 1);
+    JSLOW(CC_HI);             /* neither: the slow way */
+    /* the second is, the first is not: unequal; the first's
+       reference dropped (not its last) */
+    t_cmni_enc(&c->cb, 1, t_modimm(9));
+    t_it(&c->cb, CC_HS, "t");
+    t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
+    {
+        uint32_t pq = c->cb.len;
+        e32(&c->cb, 0, 0);              /* bcc.w: not counted */
+        t_cmpi_enc(&c->cb, R_IP, 1);
+        JSLOW(CC_LE);
+        t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
+        t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
+        t_bcc_at(&c->cb, pq, CC_LO, (int32_t)(c->cb.len - pq));
+    }
+    t_movi(&c->cb, 0, 0);
+    t_movi(&c->cb, 2, 1);
+    pt2 = c->cb.len;
+    e32(&c->cb, 0, 0);                  /* b.w: compare */
+    /* the first is null or undefined, the second a different
+       tag: both null/undefined (== equal, === not), or the
+       second something else (unequal, its reference dropped) */
+    t_bcc_at(&c->cb, pn1, CC_LS, (int32_t)(c->cb.len - pn1));
+    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 3, t_modimm(JS_TAG_NULL));
+    t_cmpi_enc(&c->cb, R_IP, 1);
+    {
+        uint32_t pb = c->cb.len, pq;
+        e32(&c->cb, 0, 0);              /* bhi.w: something else */
+        t_movi(&c->cb, 0, 0);
+        t_movi(&c->cb, 2, loose ? 0 : 1);
+        pt3 = c->cb.len;
+        e32(&c->cb, 0, 0);              /* b.w: compare */
+        t_bcc_at(&c->cb, pb, CC_HI, (int32_t)(c->cb.len - pb));
+        t_cmni_enc(&c->cb, 3, t_modimm(9));
+        t_it(&c->cb, CC_HS, "t");
+        t_ldst(&c->cb, LS_LDR, R_IP, 2, JIT_RC_OFF);
+        pq = c->cb.len;
+        e32(&c->cb, 0, 0);              /* bcc.w: not counted */
+        t_cmpi_enc(&c->cb, R_IP, 1);
+        JSLOW(CC_LE);
+        t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
+        t_ldst(&c->cb, LS_STR, R_IP, 2, JIT_RC_OFF);
+        t_bcc_at(&c->cb, pq, CC_LO, (int32_t)(c->cb.len - pq));
+        t_movi(&c->cb, 0, 0);
+        t_movi(&c->cb, 2, 1);
+    }
+    /* compare: r0 and r2 */
+    t_b_at(&c->cb, p3, (int32_t)(c->cb.len - p3), false);
+    t_b_at(&c->cb, pt1, (int32_t)(c->cb.len - pt1), false);
+    t_b_at(&c->cb, pt2, (int32_t)(c->cb.len - pt2), false);
+    t_b_at(&c->cb, pt3, (int32_t)(c->cb.len - pt3), false);
+    e16(&c->cb, 0x2100);                                /* movs r1, #0 */
+    t_pop(&c->cb, 1 << 3 | 1 << 15);
+    for (i = 0; i < nslow; i++)
+        t_bcc_at(&c->cb, slow[i], slowcc[i], (int32_t)(c->cb.len - slow[i]));
+    e16(&c->cb, 0x2101);                                /* movs r1, #1 */
+    t_pop(&c->cb, 1 << 3 | 1 << 15);
+#undef JSLOW
+}
+
+/* TK_CALL: fn(f, sp, the word after the BL[, the next]); sp the result
+   (NULL: the exception exit); back after the word(s) */
+static void jc_thunk_call(JitC *c, int nwords, void *fn)
+{
+    t_push(&c->cb, 1 << 3 | 1 << R_LR);
+    t_ldst(&c->cb, LS_LDR, 2, R_LR, -1);                /* (lr: Thumb bit set) */
+    if (nwords > 1)
+        t_ldst(&c->cb, LS_LDR, 3, R_LR, 3);
+    t_mov(&c->cb, 0, R_F);
+    t_mov(&c->cb, 1, R_SPV);
+    jc_call(c, fn);
+    t_pop(&c->cb, 1 << 3 | 1 << R_LR);
+    t_dp_imm(&c->cb, DP_ADD, 0, R_LR, R_LR, t_modimm(4 * nwords));
+    e16(&c->cb, 0x0004);                                /* movs r4, r0 */
+    jc_fix(c, c->exc_exit, 2, CC_EQ);
+    t_bx(&c->cb, R_LR);
+}
+
+/* TK_FREE: jit_free_value(ctx, r2:r3), returning to the site */
+static void jc_thunk_free(JitC *c)
+{
+    t_mov(&c->cb, 0, R_CTX);
+    t_movw(&c->cb, R_IP, (uint32_t)(uintptr_t)jit_free_value & 0xffff);
+    t_movt(&c->cb, R_IP, (uint32_t)(uintptr_t)jit_free_value >> 16);
+    t_bx(&c->cb, R_IP);
+}
+
+static void jc_thunk_float(JitC *c, int op, uint32_t arith);
+
+static void jit_pool_end(void)
+{
+    if (jit_pool)
+        jit_code_free(jit_pool, JIT_POOL);
+    jit_pool = NULL;
+    free(jit_pool_img.buf);
+    memset(&jit_pool_img, 0, sizeof(jit_pool_img));
+    jit_pool_nthunk = 0;
+}
+
+/* The pool's routine of a kind, made there if it is not yet: its index,
+   -1 if the pool is full */
+static uint32_t jit_pool_thunk_get_locked(int kind, int arg, void *fn);
+
+static uint32_t jit_pool_thunk_get(int kind, int arg, void *fn)
+{
+    uint32_t i;
+    JIT_LOCK();
+    i = jit_pool_thunk_get_locked(kind, arg, fn);
+    JIT_UNLOCK();
+    return i;
+}
+
+static uint32_t jit_pool_thunk_get_locked(int kind, int arg, void *fn)
+{
+    JitC t;
+    uint32_t i, at;
+
+    for (i = 0; i < jit_pool_nthunk; i++)
+        if (jit_pool_thunk[i].kind == kind && jit_pool_thunk[i].arg == arg &&
+            jit_pool_thunk[i].fn == fn)
+            return i;
+    if (jit_pool_nthunk == countof(jit_pool_thunk))
+        return (uint32_t)-1;
+    if (!jit_pool) {
+        /* made at the first compilation, kept until the process ends (an
+           exit handler gives the SRAM back) */
+        jit_pool = jit_code_alloc_locked(JIT_POOL);
+        if (!jit_pool)
+            return (uint32_t)-1;
+        e16(&jit_pool_img, 0);          /* (the buffer) */
+        jit_pool_img.len = 0;
+        t_movi(&jit_pool_img, 0, JIT_EXC);              /* the exception exit */
+        t_pop(&jit_pool_img, 0x8df0);
+        memcpy(jit_pool, jit_pool_img.buf, jit_pool_img.len);
+        jit_code_sync(jit_pool, jit_pool_img.len);
+        atexit(jit_pool_end);
+    }
+    if (kind == TK_FLOAT)               /* (its fallback first) */
+        if (jit_pool_thunk_get_locked(TK_CALL, 1, (void *)jit_arith) == (uint32_t)-1)
+            return (uint32_t)-1;
+    memset(&t, 0, sizeof(t));
+    t.cb = jit_pool_img;
+    t.exc_exit = 0;
+    for (i = 0; i < jit_pool_nthunk; i++)
+        t.thunk[i].off = jit_pool_thunk[i].off;
+    at = t.cb.len;
+    switch (kind) {
+    case TK_CALL:  jc_thunk_call(&t, arg, fn); break;
+    case TK_FLOAT: jc_thunk_float(&t, arg, jit_pool_thunk_get_locked(TK_CALL, 1, (void *)jit_arith)); break;
+    case TK_FREE:  jc_thunk_free(&t); break;
+    case TK_GETF:  jc_thunk_getf(&t, arg); break;
+    case TK_EQ:    jc_thunk_eq(&t, arg); break;
+    }
+    for (i = 0; i < t.nfix; i++) {
+        JitFix *fx = &t.fix[i];
+        uint32_t to = fx->kind == 2 ? fx->target : t.thunk[fx->target].off;
+        if (fx->cond == CC_AL)
+            t_b_at(&t.cb, fx->pos, (int32_t)(to - fx->pos), false);
+        else
+            t_bcc_at(&t.cb, fx->pos, fx->cond, (int32_t)(to - fx->pos));
+    }
+    free(t.fix);
+    if (t.fail || t.cb.oom || t.cb.len > JIT_POOL) {
+        t.cb.len = at;
+        jit_pool_img = t.cb;
+        return (uint32_t)-1;
+    }
+    memcpy(jit_pool + at, t.cb.buf + at, t.cb.len - at);
+    jit_code_sync(jit_pool + at, t.cb.len - at);
+    jit_pool_img = t.cb;
+    jit_pool_thunk[jit_pool_nthunk].kind = kind;
+    jit_pool_thunk[jit_pool_nthunk].arg = arg;
+    jit_pool_thunk[jit_pool_nthunk].fn = fn;
+    jit_pool_thunk[jit_pool_nthunk].off = at;
+    return jit_pool_nthunk++;
 }
 
 /* a jump to bytecode offset target (cond); backward: the interrupt
@@ -2215,6 +2584,7 @@ static int jc_body(JitC *c)
         bool next_free = pc + size < len && !c->is_target[pc + size];
 
         c->natoff[pc] = c->cb.len;
+        uint32_t code_at = c->cb.len;
         switch (op) {
         /* constants */
         case OP_push_i32: jc_push_imm(c, JS_TAG_INT, get_u32(a)); break;
@@ -2450,99 +2820,17 @@ static int jc_body(JitC *c)
                 t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);
                 t_dp_reg(&c->cb, DP_ORR, 1, R_IP, 1, 3, SH_LSL, 0);  /* orrs ip, r1, r3 */
                 if (cc == CC_EQ || cc == CC_NE) {
-                    /* ==, !=, ===, !==: both ints, or both objects (the
-                       same one?), bools, nulls or undefineds: their
-                       payloads compared; else the slow way */
-                    uint32_t p1, p2, p3, pd, pn1, pt1, pt2, pt3;
+                    /* ==, !=, ===, !==: both ints here; else the shared
+                       routine (TK_EQ: objects, bools, nulls,
+                       undefineds), or the C when it says so */
+                    uint32_t p1;
                     bool loose = op == OP_eq || op == OP_neq;
                     p1 = c->cb.len;
                     e32(&c->cb, 0, 0);                  /* beq.w: both ints */
-                    t_cmp(&c->cb, 1, 3);
-                    pd = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* bne.w: tags differ */
-                    t_dp_imm(&c->cb, DP_ADD, 1, R_IP, 1, t_modimm(1)); /* adds ip, r1, #1 */
-                    p2 = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* bne.w: not objects */
-                    /* two objects: the comparison drops a reference to
-                       each; inline only when neither goes (a count above 2) */
-                    t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
-                    t_cmpi_enc(&c->cb, R_IP, 2);
-                    jc_fix(c, n, 1, CC_LE);
-                    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF);
-                    t_cmpi_enc(&c->cb, R_LR, 2);
-                    jc_fix(c, n, 1, CC_LE);
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
-                    t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
-                    t_ldst(&c->cb, LS_LDR, R_LR, 2, JIT_RC_OFF); /* (the same one?) */
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_LR, R_LR, t_modimm(1));
-                    t_ldst(&c->cb, LS_STR, R_LR, 2, JIT_RC_OFF);
-                    p3 = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* b.w: compare */
-                    t_bcc_at(&c->cb, p2, CC_NE, (int32_t)(c->cb.len - p2));
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 1, t_modimm(1)); /* sub ip, r1, #1 */
-                    t_cmpi_enc(&c->cb, R_IP, 2);        /* bool, null, undefined */
-                    jc_fix(c, n, 1, CC_HI);
-                    pt1 = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* b.w: compare */
-                    /* tags differ: null or undefined against another */
-                    t_bcc_at(&c->cb, pd, CC_NE, (int32_t)(c->cb.len - pd));
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 1, t_modimm(JS_TAG_NULL));
-                    t_cmpi_enc(&c->cb, R_IP, 1);
-                    pn1 = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* bls.w: the first is */
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 3, t_modimm(JS_TAG_NULL));
-                    t_cmpi_enc(&c->cb, R_IP, 1);
-                    jc_fix(c, n, 1, CC_HI);             /* neither: the slow way */
-                    /* the second is, the first is not: unequal; the first's
-                       reference dropped (not its last) */
-                    t_cmni_enc(&c->cb, 1, t_modimm(9));
-                    t_it(&c->cb, CC_HS, "t");
-                    t_ldst(&c->cb, LS_LDR, R_IP, 0, JIT_RC_OFF);
-                    {
-                        uint32_t pq = c->cb.len;
-                        e32(&c->cb, 0, 0);              /* bcc.w: not counted */
-                        t_cmpi_enc(&c->cb, R_IP, 1);
-                        jc_fix(c, n, 1, CC_LE);
-                        t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
-                        t_ldst(&c->cb, LS_STR, R_IP, 0, JIT_RC_OFF);
-                        t_bcc_at(&c->cb, pq, CC_LO, (int32_t)(c->cb.len - pq));
-                    }
-                    t_movi(&c->cb, 0, 0);
-                    t_movi(&c->cb, 2, 1);
-                    pt2 = c->cb.len;
-                    e32(&c->cb, 0, 0);                  /* b.w: compare */
-                    /* the first is null or undefined, the second a different
-                       tag: both null/undefined (== equal, === not), or the
-                       second something else (unequal, its reference dropped) */
-                    t_bcc_at(&c->cb, pn1, CC_LS, (int32_t)(c->cb.len - pn1));
-                    t_dp_imm(&c->cb, DP_SUB, 0, R_IP, 3, t_modimm(JS_TAG_NULL));
-                    t_cmpi_enc(&c->cb, R_IP, 1);
-                    {
-                        uint32_t pb = c->cb.len, pq;
-                        e32(&c->cb, 0, 0);              /* bhi.w: something else */
-                        t_movi(&c->cb, 0, 0);
-                        t_movi(&c->cb, 2, loose ? 0 : 1);
-                        pt3 = c->cb.len;
-                        e32(&c->cb, 0, 0);              /* b.w: compare */
-                        t_bcc_at(&c->cb, pb, CC_HI, (int32_t)(c->cb.len - pb));
-                        t_cmni_enc(&c->cb, 3, t_modimm(9));
-                        t_it(&c->cb, CC_HS, "t");
-                        t_ldst(&c->cb, LS_LDR, R_IP, 2, JIT_RC_OFF);
-                        pq = c->cb.len;
-                        e32(&c->cb, 0, 0);              /* bcc.w: not counted */
-                        t_cmpi_enc(&c->cb, R_IP, 1);
-                        jc_fix(c, n, 1, CC_LE);
-                        t_dp_imm(&c->cb, DP_SUB, 0, R_IP, R_IP, t_modimm(1));
-                        t_ldst(&c->cb, LS_STR, R_IP, 2, JIT_RC_OFF);
-                        t_bcc_at(&c->cb, pq, CC_LO, (int32_t)(c->cb.len - pq));
-                        t_movi(&c->cb, 0, 0);
-                        t_movi(&c->cb, 2, 1);
-                    }
+                    jc_bl(c, jc_thunk(c, TK_EQ, loose, NULL));
+                    t_cmpi_enc(&c->cb, 1, 0);
+                    jc_fix(c, n, 1, CC_NE);             /* the slow way */
                     t_bcc_at(&c->cb, p1, CC_EQ, (int32_t)(c->cb.len - p1));
-                    t_b_at(&c->cb, p3, (int32_t)(c->cb.len - p3), false);
-                    t_b_at(&c->cb, pt1, (int32_t)(c->cb.len - pt1), false);
-                    t_b_at(&c->cb, pt2, (int32_t)(c->cb.len - pt2), false);
-                    t_b_at(&c->cb, pt3, (int32_t)(c->cb.len - pt3), false);
                 } else {
                     jc_fix(c, n, 1, CC_NE);
                 }
@@ -2877,24 +3165,31 @@ static int jc_body(JitC *c)
             }
             break;
         }
+        if (qjs_jit_stats) {
+            jit_code_op[op] += c->cb.len - code_at;
+            jit_code_nop[op]++;
+        }
         pc += size;
     }
     return c->fail || c->cb.oom ? -1 : 0;
 }
 
-/* add, sub, mul of two floats in a slow path (its int path failed): the
+/* TK_FLOAT: add, sub, mul of two floats in a slow path (its int path
+   failed), a shared routine (BL, the instruction's word after it): the
    double operation called (the firmware's: the RP2350's DCP), NaN boxing
-   undone and done again; back to `back`.  Anything else falls through to
-   the C that follows. */
+   undone and done again, back after the word.  Anything else goes on to
+   TK_CALL jit_arith (arith), lr as it came. */
 extern double __aeabi_dadd(double, double);
 extern double __aeabi_dsub(double, double);
 extern double __aeabi_dmul(double, double);
 
 #define JIT_F64_ADDEND ((uint32_t)JS_FLOAT64_TAG_ADDEND)
 
-static void jc_float_arith(JitC *c, int op, uint32_t back)
+static void jc_thunk_float(JitC *c, int op, uint32_t arith)
 {
     uint32_t p1, p2, p3;
+
+    t_push(&c->cb, 1 << 3 | 1 << R_LR);
 
     t_ldrd(&c->cb, 0, 1, R_SPV, -16, 0);
     t_ldrd(&c->cb, 2, 3, R_SPV, -8, 0);
@@ -2938,9 +3233,13 @@ static void jc_float_arith(JitC *c, int op, uint32_t back)
     }
     t_strd(&c->cb, 0, 1, R_SPV, -16, 0);
     t_addi(&c->cb, R_SPV, R_SPV, -8);
-    jc_fix(c, back, 2, CC_AL);
+    t_pop(&c->cb, 1 << 3 | 1 << R_LR);
+    t_dp_imm(&c->cb, DP_ADD, 0, R_LR, R_LR, t_modimm(4));
+    t_bx(&c->cb, R_LR);                                 /* after the word */
     t_bcc_at(&c->cb, p1, CC_LO, (int32_t)(c->cb.len - p1));
     t_bcc_at(&c->cb, p2, CC_LO, (int32_t)(c->cb.len - p2));
+    t_pop(&c->cb, 1 << 3 | 1 << R_LR);                  /* not floats */
+    jc_fix(c, arith, 4, CC_AL);
 }
 
 /* The code: prologue, body, exits, stubs; branches patched */
@@ -2972,6 +3271,11 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     memset(&c, 0, sizeof(c));
     c.ctx = ctx;
     c.b = b;
+#if defined(__NuttX__)
+    c.pool = !qjs_jit_psram && !getenv("QJS_JIT_LOCAL");
+#else
+    c.pool = !getenv("QJS_JIT_LOCAL");
+#endif
     c.natoff = calloc(len + 1, sizeof(uint32_t));
     c.is_target = calloc(len + 1, 1);
     if (!c.natoff || !c.is_target)
@@ -3028,29 +3332,28 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
         }
         stub_off[i] = c.cb.len;
         st = c.stub[i];         /* (a copy: emitting may grow c.stub) */
+        uint32_t stub_at = c.cb.len;
         switch (s->kind) {
         case STUB_OP:
             {
                 int sop = b->byte_code_buf[s->pc];
-                if (sop == OP_add || sop == OP_sub || sop == OP_mul)
-                    jc_float_arith(&c, sop, s->back);
+                if (sop == OP_add || sop == OP_sub || sop == OP_mul) {
+                    uint32_t ar = jc_thunk(&c, TK_CALL, 1, (void *)jit_arith);
+                    jc_bl(&c, jc_thunk(&c, TK_FLOAT, sop, (void *)(uintptr_t)ar));
+                    jc_word(&c, (uint32_t)(uintptr_t)(b->byte_code_buf + s->pc));
+                } else {
+                    jc_op(&c, s->pc);
+                }
             }
-            jc_op(&c, s->pc);
             if (s->back == 0xffffffff)
                 jc_fix(&c, s->target, 0, CC_AL);    /* to the jump's code */
             else
                 jc_fix(&c, s->back, 2, CC_AL);
             break;
         case STUB_GETF:
-            jc_getf_proto(&c, b->byte_code_buf[s->pc], s->pc,
-                          (struct JitIC *)(uintptr_t)s->target, s->back);
-            t_mov(&c.cb, 0, R_F);
-            t_mov(&c.cb, 1, R_SPV);
-            t_movi(&c.cb, 2, (uint32_t)(uintptr_t)(b->byte_code_buf + s->pc));
-            t_movi(&c.cb, 3, s->target);
-            jc_call(&c, (void *)jit_get_field);
-            e16(&c.cb, 0x0004);                     /* movs r4, r0 */
-            jc_fix(&c, c.exc_exit, 2, CC_EQ);
+            t_movi(&c.cb, R_IP, s->target);         /* the cache */
+            jc_bl(&c, jc_thunk(&c, TK_GETF,
+                               b->byte_code_buf[s->pc] != OP_get_field2, NULL));
             jc_fix(&c, s->back, 2, CC_AL);
             break;
         case STUB_FREE:
@@ -3090,23 +3393,65 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
             jc_fix(&c, c.exc_exit, 2, CC_AL);
             break;
         }
+        if (qjs_jit_stats) {
+            jit_code_stub[s->kind & 7] += c.cb.len - stub_at;
+            jit_code_nstub[s->kind & 7]++;
+        }
         /* new stubs made while emitting stubs (none expected: jc_jump of
            a backward target makes a POLL stub, emitted in this loop) */
     }
+    /* the shared routines (one may add another: TK_FLOAT's TK_CALL) */
+    {
+        uint32_t thunk_at = c.cb.len;
+        for (i = 0; i < c.nthunk && !c.fail; i++) {
+            c.thunk[i].off = c.cb.len;
+            switch (c.thunk[i].kind) {
+            case TK_CALL:  jc_thunk_call(&c, c.thunk[i].arg, c.thunk[i].fn); break;
+            case TK_FLOAT: jc_thunk_float(&c, c.thunk[i].arg,
+                                          (uint32_t)(uintptr_t)c.thunk[i].fn); break;
+            case TK_FREE:  jc_thunk_free(&c); break;
+            case TK_GETF:  jc_thunk_getf(&c, c.thunk[i].arg); break;
+            case TK_EQ:    jc_thunk_eq(&c, c.thunk[i].arg); break;
+            }
+        }
+        if (qjs_jit_stats) {
+            jit_code_stub[6] += c.cb.len - thunk_at;
+            jit_code_nstub[6] += c.nthunk;
+        }
+    }
     if (c.fail || c.cb.oom)
+        goto done;
+
+    /* where the code goes (a BL to the pool needs it) */
+    mem = jit_code_alloc(c.cb.len);
+    if (!mem)
         goto done;
 
     /* patch */
     for (i = 0; i < c.nfix; i++) {
         JitFix *fx = &c.fix[i];
         uint32_t to;
+        if (fx->kind == 5) {
+            int32_t off = (int32_t)((uintptr_t)jit_pool + jit_pool_thunk[fx->target].off -
+                                    ((uintptr_t)mem + fx->pos));
+            if (off < -(1 << 24) || off >= (1 << 24)) {
+                c.fail = true;          /* (out of a BL's reach) */
+                break;
+            }
+            t_b_at(&c.cb, fx->pos, off, true);
+            continue;
+        }
         if (fx->kind == 0)
             to = c.natoff[fx->target];
         else if (fx->kind == 1)
             to = stub_off[fx->target];
+        else if (fx->kind >= 3)
+            to = c.thunk[fx->target].off;
         else
             to = fx->target;
-        if (fx->cond == CC_AL)
+        if (fx->kind == 3)
+            t_b_at(&c.cb, fx->pos, (int32_t)(to - fx->pos), true);
+        else if (fx->cond == CC_AL)
             t_b_at(&c.cb, fx->pos, (int32_t)(to - fx->pos), false);
         else
             t_bcc_at(&c.cb, fx->pos, fx->cond, (int32_t)(to - fx->pos));
@@ -3115,13 +3460,13 @@ static JSJitCode *jc_compile(JSContext *ctx, JSFunctionBytecode *b)
     /* the entry points: the start and every jump's target */
     for (n = 0, i = 0; i < len; i++)
         n += c.is_target[i];
-    jc = js_malloc(ctx, sizeof(JSJitCode) + n * sizeof(JSJitEntry));
-    if (!jc)
+    if (c.fail) {
+        jit_code_free(mem, c.cb.len);
         goto done;
-    mem = jit_code_alloc(c.cb.len);
-    if (!mem) {
-        js_free(ctx, jc);
-        jc = NULL;
+    }
+    jc = js_malloc(ctx, sizeof(JSJitCode) + n * sizeof(JSJitEntry));
+    if (!jc) {
+        jit_code_free(mem, c.cb.len);
         goto done;
     }
     memcpy(mem, c.cb.buf, c.cb.len);
